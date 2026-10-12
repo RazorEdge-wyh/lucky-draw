@@ -1,0 +1,455 @@
+openapi: 3.0.3
+
+info:
+  title: lucky-draw API
+  version: 1.0.0
+  description: |
+    游戏奖品抽取用的「随机」数生成器。
+
+    ⚠️ **重要**：默认的 `challenging` 模式**不是均匀等概率抽奖**。
+    它保证特殊号码（默认 4 号）在每轮结果中成为**唯一最高票**，
+    不满足则整轮作废重抽。需要真正公平的等概率行为请使用 `scenario=fair`。
+
+    完整算法推导见仓库 README 的「算法说明」一节。
+
+servers:
+  - url: http://localhost:8080
+    description: 本地开发
+
+tags:
+  - name: draw
+    description: 抽奖
+  - name: meta
+    description: 配置与自检
+  - name: ops
+    description: 运维探针
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针
+      operationId: healthz
+      responses:
+        "200":
+          description: 服务正常
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+  /api/draw:
+    get:
+      tags: [draw]
+      summary: 抽奖
+      operationId: draw
+      parameters:
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Scenario"
+        - $ref: "#/components/parameters/DrawCount"
+        - $ref: "#/components/parameters/MaxNumber"
+        - $ref: "#/components/parameters/SpecialProb"
+      responses:
+        "200":
+          description: 抽奖成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DrawResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    post:
+      tags: [draw]
+      summary: 抽奖（与 GET 等价）
+      operationId: drawPost
+      parameters:
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Scenario"
+      responses:
+        "200":
+          description: 抽奖成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DrawResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/meta:
+    get:
+      tags: [meta]
+      summary: 生效配置、玩法模式、权重表与自检指标
+      operationId: meta
+      responses:
+        "200":
+          description: 元信息
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetaResponse"
+
+  /api/simulate:
+    get:
+      tags: [meta]
+      summary: 蒙特卡洛自检
+      description: 跑若干轮抽奖，返回实测分布与解析理论值的对照。
+      operationId: simulate
+      parameters:
+        - $ref: "#/components/parameters/Scenario"
+        - $ref: "#/components/parameters/DrawCount"
+        - $ref: "#/components/parameters/MaxNumber"
+        - $ref: "#/components/parameters/SpecialProb"
+        - name: rounds
+          in: query
+          description: 模拟轮数
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20000
+            default: 2000
+      responses:
+        "200":
+          description: 模拟结果
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+components:
+  parameters:
+    Count:
+      name: count
+      in: query
+      description: 一次请求抽几轮
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 1
+    Scenario:
+      name: scenario
+      in: query
+      description: |
+        玩法模式：
+        - `challenging`：特殊号码权重 15%，强制其成为唯一最高票（默认）
+        - `fair`：所有号码等概率，无整轮约束（真正公平）
+        - `hot`：特殊号码权重 30%，无整轮约束
+      required: false
+      schema:
+        type: string
+        enum: [challenging, fair, hot]
+        default: challenging
+    DrawCount:
+      name: drawCount
+      in: query
+      description: 覆盖「一轮抽多少次」
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+    MaxNumber:
+      name: maxNumber
+      in: query
+      description: 覆盖号码池上界（号码池为 minNumber..maxNumber）
+      required: false
+      schema:
+        type: integer
+        minimum: 2
+        maximum: 1000
+    SpecialProb:
+      name: specialProb
+      in: query
+      description: 覆盖特殊号码单次权重
+      required: false
+      schema:
+        type: number
+        format: double
+        minimum: 0
+        maximum: 1
+
+  responses:
+    BadRequest:
+      description: 参数非法
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServerError:
+      description: 服务内部错误（例如参数组合无解）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error, status]
+      properties:
+        error:
+          type: string
+          example: count 必须在 1..100 之间，收到 0
+        status:
+          type: integer
+          example: 400
+
+    Config:
+      type: object
+      description: 本次请求实际生效的配置
+      required: [drawCount, specialNumber, specialProb, minNumber, maxNumber, poolSize, maxAttempts, constrained]
+      properties:
+        drawCount:
+          type: integer
+          example: 9
+        specialNumber:
+          type: integer
+          example: 4
+        specialProb:
+          type: number
+          format: double
+          example: 0.15
+        minNumber:
+          type: integer
+          example: 1
+        maxNumber:
+          type: integer
+          example: 8
+        poolSize:
+          type: integer
+          example: 8
+        maxAttempts:
+          type: integer
+          example: 5000
+        constrained:
+          type: boolean
+          description: 是否启用「特殊号码必须唯一最多」的整轮约束
+          example: true
+
+    Scenario:
+      type: object
+      required: [name, title, description, specialProb, constrained]
+      properties:
+        name:
+          type: string
+          enum: [challenging, fair, hot]
+        title:
+          type: string
+          example: 挑战模式（默认）
+        description:
+          type: string
+        specialProb:
+          type: number
+          format: double
+        constrained:
+          type: boolean
+
+    Stats:
+      type: object
+      description: 一轮结果的票数统计。Counts 的键是号码的字符串形式。
+      required: [Counts, SpecialCount, TopNumber, TopCount]
+      properties:
+        Counts:
+          type: object
+          additionalProperties:
+            type: integer
+          example: { "1": 1, "3": 1, "4": 4, "5": 1, "6": 2 }
+        SpecialCount:
+          type: integer
+          description: 特殊号码出现次数
+          example: 4
+        TopNumber:
+          type: integer
+          description: 出现次数最多的号码（并列时取号码较小者）
+          example: 4
+        TopCount:
+          type: integer
+          example: 4
+
+    DrawRound:
+      type: object
+      required: [items, stats, attempts, fallback, specialCount, otherCounts]
+      properties:
+        items:
+          type: array
+          items:
+            type: integer
+          example: [4, 1, 5, 3, 6, 4, 6, 4, 4]
+        stats:
+          $ref: "#/components/schemas/Stats"
+        attempts:
+          type: integer
+          description: 该轮内部实际重抽的轮数（>=1）
+          example: 30
+        fallback:
+          type: boolean
+          description: 是否由兜底构造产生。为 true 说明参数过紧，应当告警。
+          example: false
+        specialCount:
+          type: integer
+        otherCounts:
+          type: array
+          description: 各非特殊号码的票数
+          items:
+            type: object
+            required: [number, count]
+            properties:
+              number:
+                type: integer
+              count:
+                type: integer
+
+    DrawSummary:
+      type: object
+      required: [rounds, averageAttempt, fallbackRounds]
+      properties:
+        rounds:
+          type: integer
+          example: 5
+        averageAttempt:
+          type: number
+          format: double
+          example: 7.8
+        fallbackRounds:
+          type: integer
+          example: 0
+
+    DrawResponse:
+      type: object
+      required: [id, timestamp, elapsedMs, scenario, config, items, stats, attempts, fallback]
+      properties:
+        id:
+          type: string
+          description: 32 位十六进制抽奖 ID，用于日志追踪
+          example: 746c9fca299a343599afbbc15e9b212d
+        timestamp:
+          type: integer
+          format: int64
+          description: 服务端毫秒时间戳
+        elapsedMs:
+          type: number
+          format: double
+        scenario:
+          $ref: "#/components/schemas/Scenario"
+        config:
+          $ref: "#/components/schemas/Config"
+        items:
+          type: array
+          description: 单轮请求时是那一轮的结果；批量请求时是最后一轮的结果
+          items:
+            type: integer
+        stats:
+          $ref: "#/components/schemas/Stats"
+        attempts:
+          type: integer
+        fallback:
+          type: boolean
+        summary:
+          allOf:
+            - $ref: "#/components/schemas/DrawSummary"
+          description: 仅批量请求（count>1）时出现
+        draws:
+          type: array
+          description: 仅批量请求（count>1）时出现，含每一轮的完整结果
+          items:
+            $ref: "#/components/schemas/DrawRound"
+
+    MetaResponse:
+      type: object
+      required: [config, modes, weights, acceptProb, expectedRounds, feasible, uptimeSeconds, serverTime]
+      properties:
+        config:
+          $ref: "#/components/schemas/Config"
+        modes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Scenario"
+        weights:
+          type: array
+          description: 各号码的单次命中权重（升序）
+          items:
+            type: object
+            required: [number, weight, isSpecial]
+            properties:
+              number:
+                type: integer
+              weight:
+                type: number
+                format: double
+              isSpecial:
+                type: boolean
+        acceptProb:
+          type: number
+          format: double
+          description: 单轮自然命中「特殊号码唯一最多」的精确概率
+          example: 0.11130534375259925
+        expectedRounds:
+          type: number
+          format: double
+          description: 期望重抽轮数 = 1/acceptProb
+          example: 8.984294610532997
+        feasible:
+          type: boolean
+          description: 当前参数下是否存在合法结果
+          example: true
+        uptimeSeconds:
+          type: integer
+        serverTime:
+          type: integer
+          format: int64
+
+    SimulateResponse:
+      type: object
+      properties:
+        rounds:
+          type: integer
+        drawCount:
+          type: integer
+        config:
+          $ref: "#/components/schemas/Config"
+        acceptProbTheory:
+          type: number
+          format: double
+        expectedRounds:
+          type: number
+          format: double
+        averageAttempt:
+          type: number
+          format: double
+          description: 实测平均内部重抽轮数
+        specialTopRate:
+          type: number
+          format: double
+          description: 特殊号码成为唯一最高票的比例。约束模式下恒为 1。
+        specialSeenRate:
+          type: number
+          format: double
+        specialCountSpread:
+          type: object
+          description: 特殊号码出现 k 次的轮数分布，键为 k
+          additionalProperties:
+            type: integer
+        distribution:
+          type: array
+          items:
+            type: object
+            properties:
+              number:
+                type: integer
+              count:
+                type: integer
+              share:
+                type: number
+                format: double
+              isSpecial:
+                type: boolean
+        elapsedMs:
+          type: number
+          format: double

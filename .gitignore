@@ -1,0 +1,37 @@
+# ---- 构建产物 ----
+/build/
+/dist/
+/.build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+lucky-draw
+
+# ---- Go ----
+*.test
+*.out
+coverage.txt
+coverage.html
+vendor/
+
+# ---- 环境与密钥（绝不能提交）----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 临时文件 ----
+*.log
+tmp/

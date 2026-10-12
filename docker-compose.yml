@@ -1,0 +1,37 @@
+services:
+  lucky-draw:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-local}
+    image: lucky-draw:local
+    container_name: lucky-draw
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      # 默认玩法参数，按需修改
+      DRAW_COUNT: "9"
+      SPECIAL_NUMBER: "4"
+      SPECIAL_PROB: "0.15"
+      MIN_NUMBER: "1"
+      MAX_NUMBER: "8"
+      MAX_ATTEMPTS: "5000"
+      CONSTRAINED: "true"
+    healthcheck:
+      # 镜像里没有 curl/wget，用二进制自带的健康检查参数发起 HTTP 探测。
+      test: ["CMD", "/lucky-draw", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # 抽奖服务只依赖随机源，不需要额外权限。
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

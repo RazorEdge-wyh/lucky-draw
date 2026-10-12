@@ -1,0 +1,14 @@
+# 忽略与构建无关的内容，减小构建上下文
+.git
+.github
+.build
+build
+dist
+*.md
+!README.md
+.gitignore
+docker-compose.yml
+Dockerfile
+.dockerignore
+Makefile
+scripts
