@@ -77,9 +77,13 @@ function Invoke-GitHubApi {
             return Invoke-RestMethod @params
         } catch {
             $status = $_.Exception.Response.StatusCode.value__
-            $retryable = ($status -ge 500) -or ($status -eq 429) -or ($null -eq $status)
+            $retryable = ($status -ge 500) -or ($status -eq 429) -or ($status -eq 403) -or ($null -eq $status)
             if (-not $retryable -or $attempt -eq $MaxAttempts) { throw }
+            # A 403 here is usually GitHub's secondary rate limit (too many writes
+            # in a short window). It needs a longer backoff than a plain 5xx,
+            # otherwise the retry is rejected again immediately.
             $wait = [Math]::Pow(2, $attempt)
+            if ($status -eq 403) { $wait = 15 * $attempt }
             Write-Note "HTTP $status on attempt $attempt/$MaxAttempts, retrying in ${wait}s ..."
             Start-Sleep -Seconds $wait
         }
@@ -173,28 +177,33 @@ if (-not $CommitAuthorEmail) {
 # 3. Create the repository (reuse it when it already exists)
 # ---------------------------------------------------------------------------
 
-Write-Step "Creating repository $owner/$RepoName"
-$repoPayload = @{
-    name = $RepoName
-    description = $Description
-    private = [bool]$Private
-    has_issues = $true
-    has_wiki = $false
-    auto_init = $false
-} | ConvertTo-Json
-
+Write-Step "Resolving repository $owner/$RepoName"
+# Check first with a GET instead of attempting a POST that is expected to fail:
+# GitHub applies a secondary rate limit to content creation, and every doomed
+# create call counts against it. A read costs far less than a failed write.
+$repo = $null
 try {
-    $repo = Invoke-RestMethod -Uri "$ApiBase/user/repos" -Headers $Headers -Method Post `
-        -Body $repoPayload -ContentType 'application/json; charset=utf-8'
-    Write-Ok "Repository created: $($repo.html_url)"
+    $repo = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName" -Method Get
+    Write-Ok "Repository exists, pushing into it: $($repo.html_url)"
 } catch {
     $status = $_.Exception.Response.StatusCode.value__
-    if ($status -eq 422) {
-        $repo = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName" -Headers $Headers -Method Get
-        Write-Note "Repository already exists, pushing into it: $($repo.html_url)"
-    } else {
-        throw "Failed to create repository (HTTP $status): $($_.ErrorDetails.Message)"
+    if ($status -ne 404) {
+        throw "Failed to read repository (HTTP $status): $($_.ErrorDetails.Message)"
     }
+}
+
+if (-not $repo) {
+    Write-Step "Creating repository $owner/$RepoName"
+    $repoPayload = @{
+        name = $RepoName
+        description = $Description
+        private = [bool]$Private
+        has_issues = $true
+        has_wiki = $false
+        auto_init = $false
+    } | ConvertTo-Json
+    $repo = Invoke-GitHubApi -Uri "$ApiBase/user/repos" -Method Post -Body $repoPayload
+    Write-Ok "Repository created: $($repo.html_url)"
 }
 
 $defaultBranch = $repo.default_branch

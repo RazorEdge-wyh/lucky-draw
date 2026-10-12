@@ -104,6 +104,51 @@ h1{
   background:var(--btn);
   transform:scale(1.15);
 }
+/* 本轮结果：抽过的号码按顺序排开，抽到 4 时高亮 */
+.result{
+  min-height:44px;
+  margin-bottom:24px;
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:center;
+  gap:6px;
+}
+.result .empty{
+  font-size:13px;
+  color:var(--muted);
+}
+.result i{
+  font-style:normal;
+  font-size:15px;
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  min-width:30px;
+  padding:5px 0;
+  border-radius:8px;
+  background:transparent;
+  border:1px solid var(--line);
+  color:var(--fg);
+  animation:chip .22s ease-out;
+}
+.result i.special{
+  background:var(--btn);
+  border-color:var(--btn);
+  color:#fff;
+}
+.result i.placeholder{
+  border-style:dashed;
+  color:transparent;
+}
+@keyframes chip{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
+/* 本轮小结，只在抽满九次后出现 */
+.result .summary{
+  width:100%;
+  margin-top:8px;
+  font-size:13px;
+  color:var(--muted);
+}
+.result .summary b{color:var(--btn);font-weight:600}
 button{
   width:100%;
   padding:15px 20px;
@@ -130,6 +175,8 @@ button:focus-visible{outline:2px solid var(--btn);outline-offset:3px}
   <div class="display"><span id="number">—</span></div>
 
   <div class="progress" id="progress"></div>
+
+  <div class="result" id="result"></div>
 
   <button id="draw" type="button">抽 取</button>
 </main>

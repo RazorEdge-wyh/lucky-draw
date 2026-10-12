@@ -103,7 +103,7 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-// TestIndexIsMinimal 首页只应保留标题、号码位与按钮，
+// TestIndexIsMinimal 首页只应保留标题、号码、按钮和本轮结果，
 // 用户明确要求删掉的功能不能再出现在页面上。
 func TestIndexIsMinimal(t *testing.T) {
 	h := newTestHandler(t)
@@ -113,16 +113,54 @@ func TestIndexIsMinimal(t *testing.T) {
 	}
 	html := string(body)
 
-	for _, want := range []string{"<!DOCTYPE html>", "随机数生成器", `id="draw"`, `id="number"`, "/app.js"} {
+	for _, want := range []string{"<!DOCTYPE html>", "随机数生成器", `id="draw"`, `id="number"`, `id="result"`, "/app.js"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("首页应包含 %q", want)
 		}
 	}
+
+	// 只在「用户可见的文本」里检查已删功能。不能直接扫原始源码：
+	// 注释和脚本里必然会提到这些词（例如「本轮结果」的实现说明），
+	// 那样会把正常代码误判成残留功能。
+	visible := stripScriptsAndComments(html)
 	for _, unwanted := range []string{"连抽", "十连", "概率自检", "票数统计", "请求日志", "玩法", "特殊号码"} {
-		if strings.Contains(html, unwanted) {
-			t.Errorf("首页不应再包含已删除的功能：%q", unwanted)
+		if strings.Contains(visible, unwanted) {
+			t.Errorf("页面可见文本里不应再包含已删除的功能：%q", unwanted)
 		}
 	}
+}
+
+// stripScriptsAndComments 去掉 <script> 内容与 HTML 注释，
+// 只留下用户真正能看到的文本，供上面的检查使用。
+func stripScriptsAndComments(html string) string {
+	var out strings.Builder
+	rest := html
+	for {
+		start := strings.Index(rest, "<script")
+		if start < 0 {
+			out.WriteString(rest)
+			break
+		}
+		out.WriteString(rest[:start])
+		end := strings.Index(rest[start:], "</script>")
+		if end < 0 {
+			break
+		}
+		rest = rest[start+end+len("</script>"):]
+	}
+	s := out.String()
+	for {
+		start := strings.Index(s, "<!--")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(s[start:], "-->")
+		if end < 0 {
+			break
+		}
+		s = s[:start] + s[start+end+len("-->"):]
+	}
+	return s
 }
 
 // TestAppJSServed 前端脚本必须带正确 MIME 且非空。

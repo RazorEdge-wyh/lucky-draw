@@ -5,12 +5,64 @@
   var numEl = document.getElementById("number");
   var btn = document.getElementById("draw");
   var progressEl = document.getElementById("progress");
+  var resultEl = document.getElementById("result");
 
   var TOTAL = 9;      // 一轮九次，与后端 DRAW_COUNT 一致；首屏会用响应里的 total 校正
+  var SPECIAL = 4;    // 特殊号码，用于高亮与小结
   var poolSize = TOTAL; // 号码池大小，仅用于滚动动画里生成临时数字
   var busy = false;
   var round = 0;      // 当前轮数
   var index = 0;      // 本轮已抽次数
+  var items = [];     // 本轮已抽出的号码，用于「本轮结果」展示
+
+  /* -------------------------------------------------------------- 本轮结果 */
+
+  // 把本轮已抽的号码按顺序排开，抽到 4 的高亮显示；
+  // 还没抽的位置用虚线占位，让人一眼看出本轮还剩几次。
+  function renderResult(justFinished) {
+    resultEl.innerHTML = "";
+
+    if (items.length === 0) {
+      var tip = document.createElement("span");
+      tip.className = "empty";
+      tip.textContent = "点上方按钮开始，本轮结果会显示在这里";
+      resultEl.appendChild(tip);
+      return;
+    }
+
+    for (var i = 0; i < TOTAL; i++) {
+      var chip = document.createElement("i");
+      if (i < items.length) {
+        chip.textContent = String(items[i]);
+        chip.title = "第 " + (i + 1) + " 次";
+        if (items[i] === SPECIAL) { chip.className = "special"; }
+      } else {
+        chip.className = "placeholder";
+        chip.textContent = "·";
+      }
+      resultEl.appendChild(chip);
+    }
+
+    // 抽满才给小结：这一轮 4 出现了几次、其他号码最多几次
+    if (justFinished) {
+      var counts = {};
+      for (var j = 0; j < items.length; j++) {
+        counts[items[j]] = (counts[items[j]] || 0) + 1;
+      }
+      var specialCount = counts[SPECIAL] || 0;
+      var otherMax = 0;
+      Object.keys(counts).forEach(function (k) {
+        var n = Number(k);
+        if (n !== SPECIAL && counts[k] > otherMax) { otherMax = counts[k]; }
+      });
+
+      var sum = document.createElement("div");
+      sum.className = "summary";
+      sum.innerHTML = "本轮 " + items.length + " 次 · " +
+        SPECIAL + " 出现 <b>" + specialCount + "</b> 次 · 其他号码最多 " + otherMax + " 次";
+      resultEl.appendChild(sum);
+    }
+  }
 
   /* ---------------------------------------------------------------- 进度点 */
 
@@ -75,7 +127,6 @@
     console.error(msg);
     alert(msg);
   }
-
   function draw() {
     if (busy) { return; }
     busy = true;
@@ -99,14 +150,22 @@
         index = res.index;
         poolSize = TOTAL;
 
+        // 编号从 1 开始，因此第 1 次抽取时把上一轮的结果清掉
+        if (res.index === 1) { items = []; }
+        items.push(res.number);
+
         rollTo(res.number, function () {
           renderProgress();
-          // 一轮抽满九次后，进度点清空，自动进入下一轮
+          renderResult(res.roundDone);
+
+          // 一轮抽满后，进度点与本轮结果一起归零，自动进入下一轮
           if (res.roundDone) {
             setTimeout(function () {
               index = 0;
+              items = [];
               renderProgress();
-            }, 700);
+              renderResult(false);
+            }, 2200);
           }
           busy = false;
           btn.disabled = false;
@@ -129,4 +188,5 @@
   });
 
   renderProgress();
+  renderResult(false);
 })();
