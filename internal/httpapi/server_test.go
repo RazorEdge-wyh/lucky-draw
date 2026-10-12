@@ -119,6 +119,14 @@ func TestIndexIsMinimal(t *testing.T) {
 		}
 	}
 
+	// 结果区的号码必须统一样式：不能再为特殊号码单独加高亮。
+	if strings.Contains(html, "i.special") {
+		t.Error("结果区不应再为特殊号码单独设置高亮样式（i.special）")
+	}
+	if !strings.Contains(html, "i.placeholder") {
+		t.Error("结果区应保留未抽取位置的虚线占位样式")
+	}
+
 	// 只在「用户可见的文本」里检查已删功能。不能直接扫原始源码：
 	// 注释和脚本里必然会提到这些词（例如「本轮结果」的实现说明），
 	// 那样会把正常代码误判成残留功能。
@@ -130,35 +138,39 @@ func TestIndexIsMinimal(t *testing.T) {
 	}
 }
 
-// stripScriptsAndComments 去掉 <script> 内容与 HTML 注释，
+// stripScriptsAndComments 去掉 <script>、<style> 与 HTML 注释，
 // 只留下用户真正能看到的文本，供上面的检查使用。
+//
+// 注意必须连 <style> 一起去掉：CSS 注释也是「代码」而不是可见文本，
+// 漏掉它会把注释里的词误判成残留功能（这个坑真实踩过）。
 func stripScriptsAndComments(html string) string {
-	var out strings.Builder
-	rest := html
-	for {
-		start := strings.Index(rest, "<script")
-		if start < 0 {
-			out.WriteString(rest)
-			break
+	s := html
+	for _, tag := range []string{"script", "style"} {
+		open := "<" + tag
+		closeTag := "</" + tag + ">"
+		for {
+			start := strings.Index(s, open)
+			if start < 0 {
+				break
+			}
+			rel := strings.Index(s[start:], closeTag)
+			if rel < 0 {
+				s = s[:start]
+				break
+			}
+			s = s[:start] + s[start+rel+len(closeTag):]
 		}
-		out.WriteString(rest[:start])
-		end := strings.Index(rest[start:], "</script>")
-		if end < 0 {
-			break
-		}
-		rest = rest[start+end+len("</script>"):]
 	}
-	s := out.String()
 	for {
 		start := strings.Index(s, "<!--")
 		if start < 0 {
 			break
 		}
-		end := strings.Index(s[start:], "-->")
-		if end < 0 {
+		rel := strings.Index(s[start:], "-->")
+		if rel < 0 {
 			break
 		}
-		s = s[:start] + s[start+end+len("-->"):]
+		s = s[:start] + s[start+rel+len("-->"):]
 	}
 	return s
 }

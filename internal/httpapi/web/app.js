@@ -8,7 +8,7 @@
   var resultEl = document.getElementById("result");
 
   var TOTAL = 9;      // 一轮九次，与后端 DRAW_COUNT 一致；首屏会用响应里的 total 校正
-  var SPECIAL = 4;    // 特殊号码，用于高亮与小结
+  var SPECIAL = 4;    // 特殊号码，仅用于抽满后的小结统计
   var poolSize = TOTAL; // 号码池大小，仅用于滚动动画里生成临时数字
   var busy = false;
   var round = 0;      // 当前轮数
@@ -17,7 +17,7 @@
 
   /* -------------------------------------------------------------- 本轮结果 */
 
-  // 把本轮已抽的号码按顺序排开，抽到 4 的高亮显示；
+  // 把本轮已抽的号码按顺序排开，统一样式，不区分哪个是特殊号码；
   // 还没抽的位置用虚线占位，让人一眼看出本轮还剩几次。
   function renderResult(justFinished) {
     resultEl.innerHTML = "";
@@ -35,7 +35,6 @@
       if (i < items.length) {
         chip.textContent = String(items[i]);
         chip.title = "第 " + (i + 1) + " 次";
-        if (items[i] === SPECIAL) { chip.className = "special"; }
       } else {
         chip.className = "placeholder";
         chip.textContent = "·";

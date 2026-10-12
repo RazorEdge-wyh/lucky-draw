@@ -104,7 +104,7 @@ h1{
   background:var(--btn);
   transform:scale(1.15);
 }
-/* 本轮结果：抽过的号码按顺序排开，抽到 4 时高亮 */
+/* 本轮结果：抽过的号码按顺序排开，统一蓝色，不区分特殊号码 */
 .result{
   min-height:44px;
   margin-bottom:24px;
@@ -126,18 +126,14 @@ h1{
   min-width:30px;
   padding:5px 0;
   border-radius:8px;
-  background:transparent;
-  border:1px solid var(--line);
-  color:var(--fg);
+  background:var(--btn);
+  border:1px solid var(--btn);
+  color:#fff;
   animation:chip .22s ease-out;
 }
-.result i.special{
-  background:var(--btn);
-  border-color:var(--btn);
-  color:#fff;
-}
 .result i.placeholder{
-  border-style:dashed;
+  background:transparent;
+  border:1px dashed var(--line);
   color:transparent;
 }
 @keyframes chip{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}

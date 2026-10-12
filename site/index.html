@@ -45,7 +45,7 @@ h1{margin:0 0 36px; font-size:19px; font-weight:600; letter-spacing:.02em}
   transition:background .2s, transform .2s;
 }
 .progress i.done{background:var(--btn); transform:scale(1.15)}
-/* 本轮结果：抽过的号码按顺序排开，抽到 4 时高亮 */
+/* 本轮结果：抽过的号码按顺序排开，统一蓝色，不区分特殊号码 */
 .result{
   min-height:44px; margin-bottom:24px;
   display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:6px;
@@ -54,11 +54,10 @@ h1{margin:0 0 36px; font-size:19px; font-weight:600; letter-spacing:.02em}
 .result i{
   font-style:normal; font-size:15px; font-weight:600;
   font-variant-numeric:tabular-nums; min-width:30px; padding:5px 0;
-  border-radius:8px; border:1px solid var(--line); color:var(--fg);
+  border-radius:8px; border:1px solid var(--btn); background:var(--btn); color:#fff;
   animation:chip .22s ease-out;
 }
-.result i.special{background:var(--btn); border-color:var(--btn); color:#fff}
-.result i.placeholder{border-style:dashed; color:transparent}
+.result i.placeholder{background:transparent; border:1px dashed var(--line); color:transparent}
 @keyframes chip{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
 .result .summary{width:100%; margin-top:8px; font-size:13px; color:var(--muted)}
 .result .summary b{color:var(--btn); font-weight:600}
@@ -271,7 +270,7 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
 
   /* -------------------------------------------------------------- 本轮结果 */
 
-  // 把本轮已抽的号码按顺序排开，抽到 4 的高亮；
+  // 把本轮已抽的号码按顺序排开，统一样式，不区分哪个是特殊号码；
   // 还没抽的位置用虚线占位，一眼就能看出本轮还剩几次。
   function renderResult(justFinished) {
     resultEl.innerHTML = "";
@@ -289,7 +288,6 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
       if (i < items.length) {
         chip.textContent = String(items[i]);
         chip.title = "第 " + (i + 1) + " 次";
-        if (items[i] === SPECIAL) { chip.className = "special"; }
       } else {
         chip.className = "placeholder";
         chip.textContent = "·";
