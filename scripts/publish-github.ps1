@@ -52,6 +52,40 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "    $msg" -ForegroundColor Green }
 function Write-Note($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
 
+# GitHub occasionally answers 5xx on the Git Data endpoints. Those are transient,
+# so retry with exponential backoff instead of failing a 30-file upload halfway.
+function Invoke-GitHubApi {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$Method,
+        $Body,
+        [string]$ContentType = 'application/json; charset=utf-8',
+        [int]$MaxAttempts = 5
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $params = @{
+                Uri = $Uri
+                Headers = $Headers
+                Method = $Method
+                TimeoutSec = 60
+            }
+            if ($null -ne $Body) {
+                $params['Body'] = $Body
+                $params['ContentType'] = $ContentType
+            }
+            return Invoke-RestMethod @params
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            $retryable = ($status -ge 500) -or ($status -eq 429) -or ($null -eq $status)
+            if (-not $retryable -or $attempt -eq $MaxAttempts) { throw }
+            $wait = [Math]::Pow(2, $attempt)
+            Write-Note "HTTP $status on attempt $attempt/$MaxAttempts, retrying in ${wait}s ..."
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 1. Validate token and collect files
 # ---------------------------------------------------------------------------
@@ -175,8 +209,7 @@ $treeItems = @()
 foreach ($f in $files) {
     $b64 = [Convert]::ToBase64String($f.Bytes)
     $body = @{ content = $b64; encoding = 'base64' } | ConvertTo-Json -Compress
-    $blob = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/blobs" -Headers $Headers `
-        -Method Post -Body $body -ContentType 'application/json; charset=utf-8'
+    $blob = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/blobs" -Method Post -Body $body
     $treeItems += @{
         path = $f.Path
         mode = '100644'
@@ -192,8 +225,7 @@ foreach ($f in $files) {
 
 Write-Step 'Creating tree'
 $treeBody = @{ tree = $treeItems } | ConvertTo-Json -Depth 6 -Compress
-$newTree = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/trees" -Headers $Headers `
-    -Method Post -Body $treeBody -ContentType 'application/json; charset=utf-8'
+$newTree = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/trees" -Method Post -Body $treeBody
 Write-Ok "tree sha = $($newTree.sha)"
 
 # When reusing an existing repository the target branch may already have a HEAD,
@@ -217,19 +249,16 @@ $commitBody = @{
     parents = $parents
 } | ConvertTo-Json -Depth 5 -Compress
 
-$commit = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/commits" -Headers $Headers `
-    -Method Post -Body $commitBody -ContentType 'application/json; charset=utf-8'
+$commit = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/commits" -Method Post -Body $commitBody
 Write-Ok "commit sha = $($commit.sha)"
 
 Write-Step "Updating branch ref $Branch"
 if ($parentSha) {
     $refBody = @{ sha = $commit.sha; force = $false } | ConvertTo-Json -Compress
-    $null = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/refs/heads/$Branch" -Headers $Headers `
-        -Method Patch -Body $refBody -ContentType 'application/json; charset=utf-8'
+    $null = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/refs/heads/$Branch" -Method Patch -Body $refBody
 } else {
     $refBody = @{ ref = "refs/heads/$Branch"; sha = $commit.sha } | ConvertTo-Json -Compress
-    $null = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/refs" -Headers $Headers `
-        -Method Post -Body $refBody -ContentType 'application/json; charset=utf-8'
+    $null = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/refs" -Method Post -Body $refBody
 }
 Write-Ok 'Branch updated'
 

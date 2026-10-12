@@ -35,12 +35,17 @@ jobs:
 
       - name: 校验 go.mod 是否整洁
         run: |
+          # 本项目零外部依赖，因此正常情况下根本没有 go.sum 文件。
+          # 不能直接对 go.sum 跑 git diff：路径不存在时 git 会以 128 退出，
+          # 在 bash -e 下会把这个「文件不存在」误判成校验失败。
+          # 改成用 git status 观察 tidy 前后是否有任何变化，与文件是否存在无关。
           go mod tidy
-          if ! git diff --quiet go.mod go.sum 2>/dev/null; then
+          if [ -n "$(git status --porcelain -- go.mod go.sum)" ]; then
             echo "::error::go.mod / go.sum 与代码不同步，请在本地执行 go mod tidy 后提交"
-            git diff go.mod go.sum
+            git --no-pager diff -- go.mod go.sum
             exit 1
           fi
+          echo "go.mod 整洁（无外部依赖，go.sum 不存在属正常）"
 
       - name: 检查代码格式
         run: |
