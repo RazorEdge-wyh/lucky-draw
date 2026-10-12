@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# 同一分支上新的推送会取消旧的构建，避免排队浪费额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    name: 测试与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: 校验 go.mod 是否整洁
+        run: |
+          go mod tidy
+          if ! git diff --quiet go.mod go.sum 2>/dev/null; then
+            echo "::error::go.mod / go.sum 与代码不同步，请在本地执行 go mod tidy 后提交"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: 检查代码格式
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未格式化，请执行 gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试（含竞态检测）
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: 覆盖率摘要
+        run: |
+          go tool cover -func=coverage.out | tail -n 1
+          {
+            echo "## 测试覆盖率"
+            echo '```'
+            go tool cover -func=coverage.out | tail -n 20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 构建二进制
+        run: |
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X main.version=${GITHUB_SHA::7}" \
+            -o lucky-draw .
+
+      - name: 冒烟测试（启动服务并打真实请求）
+        run: |
+          ./lucky-draw -check
+          PORT=18080 ./lucky-draw &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+
+          echo "--- /healthz ---"
+          curl -fsS http://127.0.0.1:18080/healthz
+
+          echo "--- /api/meta ---"
+          curl -fsS http://127.0.0.1:18080/api/meta
+
+          echo "--- /api/draw ---"
+          draw="$(curl -fsS http://127.0.0.1:18080/api/draw)"
+          echo "$draw"
+
+          # 用 python 校验核心不变量：特殊号码必须出现且是唯一最高票。
+          echo "$draw" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          items = d["items"]
+          special = d["config"]["specialNumber"]
+          assert len(items) == 9, items
+          assert items.count(special) > 0, items
+          other_max = max(c for n, c in d["stats"]["Counts"].items() if int(n) != special)
+          assert items.count(special) > other_max, (items, other_max)
+          print("不变量校验通过：特殊号码 %d 出现 %d 次，其他号码最多 %d 次"
+                % (special, items.count(special), other_max))
+          '
+
+          echo "--- 非法参数必须 400 ---"
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/draw?count=0)"
+          test "$code" = "400" || { echo "期望 400，实际 $code"; exit 1; }
+          echo "非法参数返回 400，符合预期"
+
+      - name: 上传覆盖率报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: warn
+
+  docker:
+    name: 构建容器镜像
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 只在 CI 里验证镜像能构建成功，不推送到任何仓库。
+      - name: 构建（不推送）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: lucky-draw:ci
+          build-args: |
+            VERSION=ci-${GITHUB_SHA::7}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 启动镜像并做健康检查
+        run: |
+          docker run -d --name lucky-draw-ci -p 18081:8080 lucky-draw:ci
+          trap 'docker logs lucky-draw-ci || true; docker rm -f lucky-draw-ci || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18081/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:18081/healthz
+          curl -fsS http://127.0.0.1:18081/api/draw
+          echo "容器镜像运行正常"

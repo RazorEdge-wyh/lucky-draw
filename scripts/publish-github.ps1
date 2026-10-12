@@ -40,42 +40,13 @@ Set-StrictMode -Version Latest
 $ApiBase = 'https://api.github.com'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
-# Explicit allow-list instead of walking the directory, so build artifacts and
-# secrets can never be uploaded by accident.
-$IncludeFiles = @(
-    '.dockerignore',
-    '.env.example',
-    '.gitignore',
-    'CHANGELOG.md',
-    'Dockerfile',
-    'LICENSE',
-    'Makefile',
-    'README.md',
-    'api/openapi.yaml',
-    'cmd/draw/main.go',
-    'docker-compose.yml',
-    'docs/api-examples.md',
-    'go.mod',
-    'internal/config/config.go',
-    'internal/config/config_test.go',
-    'internal/engine/engine.go',
-    'internal/engine/engine_test.go',
-    'internal/engine/probability_test.go',
-    'internal/httpapi/assets.go',
-    'internal/httpapi/dto.go',
-    'internal/httpapi/server.go',
-    'internal/httpapi/server_test.go',
-    'internal/httpapi/web/app.js',
-    'internal/httpapi/web/index.html',
-    'internal/randsource/randsource.go',
-    'internal/scenario/scenario.go',
-    'internal/scenario/scenario_test.go',
-    'main.go',
-    'scripts/publish-github.ps1'
-)
+# Walk the working tree instead of keeping a hand-written file list: a stale
+# list silently drops files (that is exactly how .github/workflows/ci.yml was
+# missed on the first push), and directory walking picks up new files for free.
+$ExcludeDirs = @('.git', '.build', 'build', 'dist', 'node_modules', 'secrets', '.idea', '.vscode')
 
-# Second line of defense against ever committing these.
-$ForbiddenPatterns = @('*.exe', '*.log', '.env', '*.pem', '*.key', 'secrets/*', '.build/*', 'build/*', 'dist/*')
+# Second line of defense: never upload these even if they slip through.
+$ForbiddenPatterns = @('*.exe', '*.log', '*.tmp', '.env', '*.pem', '*.key', '*.p12', '*.pfx', 'secrets/*')
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "    $msg" -ForegroundColor Green }
@@ -94,16 +65,31 @@ if (-not $token -and -not $DryRun) {
 Write-Step "Collecting files (repo root: $RepoRoot)"
 $files = @()
 $totalBytes = 0
+$skipped = @()
 
-foreach ($rel in $IncludeFiles) {
-    $full = Join-Path $RepoRoot ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
-        throw "File listed but not found: $rel ($full)"
+$allFiles = Get-ChildItem -LiteralPath $RepoRoot -Recurse -File -Force
+foreach ($f in $allFiles) {
+    $rel = $f.FullName.Substring($RepoRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+
+    # Skip anything under an excluded directory (match at any path depth).
+    $parts = $rel -split '/'
+    $inExcluded = $false
+    foreach ($p in $parts[0..([Math]::Max(0, $parts.Count - 2))]) {
+        if ($ExcludeDirs -contains $p) { $inExcluded = $true; break }
     }
+    if ($inExcluded) { $skipped += $rel; continue }
+
+    $forbidden = $false
     foreach ($pat in $ForbiddenPatterns) {
-        if ($rel -like $pat) { throw "Refusing to commit forbidden file: $rel" }
+        if ($rel -like $pat) { $forbidden = $true; break }
     }
-    $bytes = [IO.File]::ReadAllBytes($full)
+    if ($forbidden) {
+        Write-Note "SKIPPED (forbidden pattern): $rel"
+        $skipped += $rel
+        continue
+    }
+
+    $bytes = [IO.File]::ReadAllBytes($f.FullName)
     $totalBytes += $bytes.Length
     $files += [pscustomobject]@{
         Path = $rel
@@ -114,6 +100,14 @@ foreach ($rel in $IncludeFiles) {
 
 Write-Ok ("{0} files, {1:N1} KB total" -f $files.Count, ($totalBytes / 1KB))
 foreach ($f in $files) { Write-Host ("      {0,10:N0} B  {1}" -f $f.Size, $f.Path) }
+if ($skipped.Count -gt 0) {
+    Write-Note ("skipped {0} path(s): {1}" -f $skipped.Count, ($skipped -join ', '))
+}
+
+# Fail loudly if the CI workflow is absent: without it nothing runs on push.
+if (-not ($files | Where-Object { $_.Path -eq '.github/workflows/ci.yml' })) {
+    throw ".github/workflows/ci.yml is missing from the collected file set"
+}
 
 if ($DryRun) {
     Write-Note 'DryRun: no network requests were made.'
