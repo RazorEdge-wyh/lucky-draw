@@ -229,15 +229,21 @@ func TestFirstDrawStartsNewRound(t *testing.T) {
 	}
 }
 
-// TestRoundIsNineDrawsAndFourAlwaysWins 核心不变量。
+// TestUniformRoundIsFairAndComplete 默认模式是**均匀随机**。
 //
-// 一轮九次、每次只返回一个号码；整轮结束后，4 必须出现过，
-// 且它的票数严格多于其他任何号码。这条断言直接对应需求：
-// 「九次为一轮，一轮一定命中 4」。
-func TestRoundIsNineDrawsAndFourAlwaysWins(t *testing.T) {
+// 一轮九次、每次只返回一个号码，号码在 1..8 之间均匀分布：
+//   - 没有任何号码享有「保证出现」的特权（4 也可能整轮不出现，这是正常的）；
+//   - 每个号码的总体占比应当接近 1/8。
+//
+// 这个测试就是「真随机」的守护者：如果有人重新引入偏向，它会失败。
+func TestUniformRoundIsFairAndComplete(t *testing.T) {
 	h := newTestHandler(t)
 
-	for roundNo := 1; roundNo <= 80; roundNo++ {
+	const rounds = 400
+	dist := map[int]int{}
+	totalDraws := 0
+
+	for roundNo := 1; roundNo <= rounds; roundNo++ {
 		c := newClient(h) // 每轮换一个全新"浏览器"，确保是独立的一轮
 		items := make([]int, 0, 9)
 
@@ -247,12 +253,6 @@ func TestRoundIsNineDrawsAndFourAlwaysWins(t *testing.T) {
 			if resp.Index != i {
 				t.Fatalf("第 %d 轮第 %d 次的 index 应为 %d，实际 %d", roundNo, i, i, resp.Index)
 			}
-			if resp.Round != roundNo {
-				// 新会话的轮数恒为 1；只有同一会话继续才递增，这里每次都是新会话。
-				if resp.Round != 1 {
-					t.Fatalf("新会话的轮数应为 1，实际 %d", resp.Round)
-				}
-			}
 			if resp.RoundDone != (i == 9) {
 				t.Fatalf("第 %d 轮第 %d 次 roundDone 应为 %t，实际 %t",
 					roundNo, i, i == 9, resp.RoundDone)
@@ -261,6 +261,56 @@ func TestRoundIsNineDrawsAndFourAlwaysWins(t *testing.T) {
 				t.Fatalf("号码越界: %d", resp.Number)
 			}
 			items = append(items, resp.Number)
+			dist[resp.Number]++
+			totalDraws++
+		}
+
+		if len(items) != 9 {
+			t.Fatalf("第 %d 轮应有 9 个号码，实际 %d", roundNo, len(items))
+		}
+	}
+
+	// 每个号码都应出现过，且占比接近 1/8。
+	// 400 轮 × 9 次 = 3600 次抽取，单个号码占比的标准差约 0.0055，
+	// 因此 1/8 ± 0.04 是很宽松的区间，不会误报，但足以抓出明显偏向。
+	want := 1.0 / 8.0
+	for n := 1; n <= 8; n++ {
+		if dist[n] == 0 {
+			t.Errorf("号码 %d 从未出现（均匀随机下不该发生）", n)
+		}
+		share := float64(dist[n]) / float64(totalDraws)
+		if diff := share - want; diff > 0.04 || diff < -0.04 {
+			t.Errorf("号码 %d 占比 %.4f，偏离均匀值 %.4f 过多（可能存在偏向）", n, share, want)
+		}
+	}
+
+	// 关键回归断言：4 的占比必须**接近 1/8，而不是有偏模式下的约 37%**。
+	share4 := float64(dist[4]) / float64(totalDraws)
+	if share4 > 0.2 {
+		t.Errorf("号码 4 占比 %.4f 明显偏高，像是又启用了有偏模式（应为 %.4f）", share4, want)
+	}
+}
+
+// TestBiasedModeStillWorksWhenEnabled 备份下来的有偏算法必须仍然可用：
+// 显式设置 SPECIAL_NUMBER 后，接口应当恢复「每轮必中该号码」的行为。
+func TestBiasedModeStillWorksWhenEnabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.SpecialNumber = 4 // 显式启用有偏模式
+	if !cfg.Weighted() {
+		t.Fatal("测试配置应当处于有偏模式")
+	}
+
+	api, err := New(cfg)
+	if err != nil {
+		t.Fatalf("构造服务失败: %v", err)
+	}
+	h := api.Handler()
+
+	for roundNo := 1; roundNo <= 40; roundNo++ {
+		c := newClient(h)
+		items := make([]int, 0, 9)
+		for i := 1; i <= 9; i++ {
+			items = append(items, c.drawOnce(t).Number)
 		}
 
 		counts := map[int]int{}
@@ -268,19 +318,42 @@ func TestRoundIsNineDrawsAndFourAlwaysWins(t *testing.T) {
 			counts[n]++
 		}
 		if counts[4] == 0 {
-			t.Fatalf("第 %d 轮没有命中 4：%v", roundNo, items)
+			t.Fatalf("有偏模式下第 %d 轮没有命中 4：%v", roundNo, items)
 		}
 		for n, cnt := range counts {
 			if n != 4 && cnt >= counts[4] {
-				t.Fatalf("第 %d 轮 4 不是唯一最高票：%v（4 出现 %d 次，%d 出现 %d 次）",
-					roundNo, items, counts[4], n, cnt)
+				t.Fatalf("有偏模式下第 %d 轮 4 不是唯一最高票：%v", roundNo, items)
 			}
 		}
 	}
 }
 
+// TestRoundIsNineDrawsAndFourAlwaysWinsLegacy 保留一条针对有偏模式的最严格断言，
+// 直接驱动引擎层，确保被备份的算法在 80 轮里都不出错。
+func TestRoundIsNineDrawsAndFourAlwaysWinsLegacy(t *testing.T) {
+	cfg := config.Default()
+	cfg.SpecialNumber = 4
+	api, err := New(cfg)
+	if err != nil {
+		t.Fatalf("构造服务失败: %v", err)
+	}
+
+	for roundNo := 1; roundNo <= 80; roundNo++ {
+		seq := api.engine.DrawSequence()
+		if len(seq) != 9 {
+			t.Fatalf("第 %d 轮长度应为 9，实际 %d", roundNo, len(seq))
+		}
+		st := api.engine.Stats(seq)
+		if st.SpecialCount == 0 || st.TopNumber != 4 {
+			t.Fatalf("第 %d 轮 4 未成为唯一最高票：%v", roundNo, seq)
+		}
+	}
+}
+
 // TestConsecutiveRoundsInOneSession 同一个会话连续抽 18 次应当跨越两轮，
-// 第二轮的轮数递增，且两轮各自都满足「4 是唯一最高票」。
+// 第二轮的轮数递增，每轮都是完整的 9 次。
+//
+// 注意这里刻意**不**断言 4 一定出现：默认是均匀随机，4 整轮不出现是正常的。
 func TestConsecutiveRoundsInOneSession(t *testing.T) {
 	h := newTestHandler(t)
 	c := newClient(h)
@@ -295,19 +368,13 @@ func TestConsecutiveRoundsInOneSession(t *testing.T) {
 			if resp.Index != i {
 				t.Fatalf("第 %d 轮第 %d 次的 index 应为 %d，实际 %d", roundNo, i, i, resp.Index)
 			}
+			if resp.Number < 1 || resp.Number > 8 {
+				t.Fatalf("号码越界: %d", resp.Number)
+			}
 			items = append(items, resp.Number)
 		}
-		counts := map[int]int{}
-		for _, n := range items {
-			counts[n]++
-		}
-		if counts[4] == 0 {
-			t.Fatalf("第 %d 轮没有命中 4：%v", roundNo, items)
-		}
-		for n, cnt := range counts {
-			if n != 4 && cnt >= counts[4] {
-				t.Fatalf("第 %d 轮 4 不是唯一最高票：%v", roundNo, items)
-			}
+		if len(items) != 9 {
+			t.Fatalf("第 %d 轮应有 9 个号码，实际 %d", roundNo, len(items))
 		}
 	}
 }

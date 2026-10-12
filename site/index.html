@@ -88,27 +88,30 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
 /* ===========================================================================
    随机数生成器（静态版）
 
-   与仓库里 Go 服务端版本算法完全一致，只是搬到浏览器里跑：
-     1. 加权抽样：4 的权重 15%，其余 7 个号码各约 12.14%，抽九次；
-     2. 整轮校验：4 必须出现过，且票数严格多于其他任何号码；不满足就整轮重抽。
+   **均匀随机**：号码池 1..8，每个号码概率完全相等（各 1/8）。
+   九次为一轮，每次点击抽出一个号码；九次是彼此独立的独立抽取。
+
+   因此：
+     - 没有任何号码享有特权，也没有任何号码保证出现；
+     - 某个号码一整轮都不出现是正常现象（概率约 (7/8)^9 ≈ 30%）；
+     - 一轮里出现重复号码也是正常的。
 
    随机源用 crypto.getRandomValues()（浏览器自带的密码学安全随机源），
-   不是 Math.random()。取模偏置用拒绝采样消除，与 Go 版的 randsource 实现同源。
+   不是 Math.random()。取模偏置用拒绝采样消除，与 Go 版 randsource 实现同源。
+   算法与仓库里 Go 服务端的均匀随机路径一致。
 
-   整轮九次的序列一次性算好并校验通过，之后每次点击只是按顺序取下一个，
-   所以不会出现「抽到第九个才发现凑不齐」的情况。
+   历史说明：项目最初是「加权抽样 + 整轮必中 4」的有偏实现，
+   那套算法已完整备份在 internal/engine/biased_backup.go 与
+   docs/legacy-biased-algorithm.md，并可通过 SPECIAL_NUMBER 环境变量重新启用。
    =========================================================================== */
 (function () {
   "use strict";
 
   /* ---------------------------------------------------------------- 配置 */
   var CONFIG = {
-    drawCount: 9,      // 一轮抽多少次
-    specialNumber: 4,  // 特殊号码
-    specialProb: 0.15, // 特殊号码单次权重
+    drawCount: 9,   // 一轮抽多少次
     minNumber: 1,
-    maxNumber: 8,
-    maxAttempts: 5000  // 整轮重抽上限
+    maxNumber: 8
   };
 
   /* ------------------------------------------------------------ 随机源 */
@@ -141,7 +144,7 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
   }
 
   // [0,1) 上的均匀值，取 53 位尾数（与 Go 版 Float64 一致）。
-  // 用两个 32 位拼出 53 位有效随机位：高 21 位与低 32 位。
+  // 当前均匀随机路径只用 randInt；这个函数保留下来供需要浮点随机的场合使用。
   function randFloat() {
     crypto.getRandomValues(u64);
     var hi = u64[0] >>> 11;       // 取高 21 位
@@ -150,107 +153,32 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
     return (hi * 4294967296 + lo) / 9007199254740992; // 2^53
   }
 
-  /* -------------------------------------------------------- 加权抽样池 */
+  /* ------------------------------------------------------------ 号码池 */
 
+  // 号码池就是 minNumber..maxNumber 的全部号码，每个概率完全相等。
   function buildPool(cfg) {
-    var others = [];
-    for (var n = cfg.minNumber; n <= cfg.maxNumber; n++) {
-      if (n !== cfg.specialNumber) { others.push(n); }
-    }
-    if (others.length === 0) { throw new Error("号码池为空"); }
-
-    var per = (1 - cfg.specialProb) / others.length;
     var numbers = [];
-    var cum = [];
-    var acc = 0;
-    for (var m = cfg.minNumber; m <= cfg.maxNumber; m++) {
-      acc += (m === cfg.specialNumber) ? cfg.specialProb : per;
-      numbers.push(m);
-      cum.push(acc);
-    }
-    // 抹掉浮点累加误差，保证尾部样本一定能落到表内
-    cum[cum.length - 1] = 1;
-    return { numbers: numbers, cum: cum, others: others, per: per };
+    for (var n = cfg.minNumber; n <= cfg.maxNumber; n++) { numbers.push(n); }
+    if (numbers.length === 0) { throw new Error("号码池为空"); }
+    return { numbers: numbers, per: 1 / numbers.length };
   }
 
+  // 等概率取一个号码。用 randInt 保证无偏，
+  // 而不是 Math.floor(randFloat() * n)（那样会引入取模式偏差）。
   function pick(pool) {
-    var x = randFloat();
-    for (var i = 0; i < pool.cum.length; i++) {
-      if (x < pool.cum[i]) { return pool.numbers[i]; }
-    }
-    return pool.numbers[pool.numbers.length - 1];
+    return pool.numbers[randInt(pool.numbers.length)];
   }
 
   /* ------------------------------------------------------------ 整轮生成 */
 
-  // 判定：特殊号码必须出现，且严格多于其他每个号码。
-  function isAccepted(items, cfg) {
-    var counts = {};
-    var i;
-    for (i = 0; i < items.length; i++) {
-      counts[items[i]] = (counts[items[i]] || 0) + 1;
-    }
-    var special = counts[cfg.specialNumber] || 0;
-    if (special === 0) { return false; }
-    for (var n = cfg.minNumber; n <= cfg.maxNumber; n++) {
-      if (n === cfg.specialNumber) { continue; }
-      if ((counts[n] || 0) >= special) { return false; }
-    }
-    return true;
-  }
-
-  function oneRound(pool, cfg) {
+  // 生成一整轮：九次彼此独立的等概率抽取，不做任何筛选或重抽。
+  //
+  // 因此某一轮里某个号码一次都不出现是完全正常的
+  // （某个指定号码九次全不出现的概率约 (7/8)^9 ≈ 30%）。
+  function generateRound(pool, cfg) {
     var items = [];
     for (var i = 0; i < cfg.drawCount; i++) { items.push(pick(pool)); }
     return items;
-  }
-
-  // 兜底构造：重抽超限时直接构造一个合法序列，保证永不卡死。
-  // 找最小的 k 使「特殊号码 k 次、其他各最多 k-1 次」能填满一轮。
-  function fallback(cfg, pool) {
-    var n = cfg.drawCount;
-    var others = pool.others;
-    for (var k = 1; k <= n; k++) {
-      if (n - k > others.length * (k - 1)) { continue; }
-      var items = [];
-      var j;
-      for (j = 0; j < k; j++) { items.push(cfg.specialNumber); }
-      var used = {};
-      while (items.length < n) {
-        var placed = false;
-        for (var oi = 0; oi < others.length; oi++) {
-          var cand = others[oi];
-          if ((used[cand] || 0) < k - 1) {
-            used[cand] = (used[cand] || 0) + 1;
-            items.push(cand);
-            placed = true;
-            break;
-          }
-        }
-        if (!placed) { break; }
-      }
-      if (items.length === n) {
-        // Fisher-Yates 洗牌，保证位置也随机
-        for (var s = n - 1; s > 0; s--) {
-          var r = randInt(s + 1);
-          var t = items[s]; items[s] = items[r]; items[r] = t;
-        }
-        return items;
-      }
-    }
-    // 理论上不可达（号码池至少有 2 个号码时 k=n 一定可行）
-    var all = [];
-    for (var q = 0; q < n; q++) { all.push(cfg.specialNumber); }
-    return all;
-  }
-
-  // 生成一整轮合法序列
-  function generateRound(pool, cfg) {
-    for (var i = 0; i < cfg.maxAttempts; i++) {
-      var items = oneRound(pool, cfg);
-      if (isAccepted(items, cfg)) { return items; }
-    }
-    return fallback(cfg, pool);
   }
 
   /* ---------------------------------------------------------------- 页面 */
@@ -262,7 +190,6 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
 
   var pool = buildPool(CONFIG);
   var TOTAL = CONFIG.drawCount;
-  var SPECIAL = CONFIG.specialNumber;
   var seq = [];      // 当前这一轮的号码序列
   var pos = 0;       // 已交付到第几个
   var items = [];    // 本轮已抽出的号码，用于「本轮结果」展示
@@ -295,23 +222,22 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
       resultEl.appendChild(chip);
     }
 
-    // 抽满才给小结：本轮 4 出现几次、其他号码最多几次
+    // 抽满才给小结：本轮出现了几个不同的号码、最多重复了几次
     if (justFinished) {
       var counts = {};
       for (var j = 0; j < items.length; j++) {
         counts[items[j]] = (counts[items[j]] || 0) + 1;
       }
-      var specialCount = counts[SPECIAL] || 0;
-      var otherMax = 0;
+      var distinct = Object.keys(counts).length;
+      var maxRepeat = 0;
       Object.keys(counts).forEach(function (k) {
-        var n = Number(k);
-        if (n !== SPECIAL && counts[k] > otherMax) { otherMax = counts[k]; }
+        if (counts[k] > maxRepeat) { maxRepeat = counts[k]; }
       });
 
       var sum = document.createElement("div");
       sum.className = "summary";
-      sum.innerHTML = "本轮 " + items.length + " 次 · " +
-        SPECIAL + " 出现 <b>" + specialCount + "</b> 次 · 其他号码最多 " + otherMax + " 次";
+      sum.innerHTML = "本轮 " + items.length + " 次 · 出现 <b>" + distinct +
+        "</b> 个不同号码 · 最多重复 " + maxRepeat + " 次";
       resultEl.appendChild(sum);
     }
   }

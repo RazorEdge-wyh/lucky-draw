@@ -33,6 +33,13 @@ type Result struct {
 // （例如「每个号码最多出现 k 次」与「需要 n 个号码」互相冲突）。
 var ErrUnreachable = errors.New("engine: 当前参数下无法构造合法的抽奖结果")
 
+// ErrNotWeighted 表示配置没有启用有偏模式（SpecialNumber 不在号码池内），
+// 因此不能构造有偏生成器。
+var ErrNotWeighted = errors.New("engine: 未启用有偏模式（请设置号码池内的 SPECIAL_NUMBER）")
+
+// ErrNilSource 表示调用方传入了 nil 随机源。
+var ErrNilSource = errors.New("engine: 随机源不能为 nil")
+
 // Stats 是一轮抽奖的统计视图。
 type Stats struct {
 	// Counts 是每个号码的出现次数。
@@ -77,6 +84,16 @@ func NewWithSource(cfg config.Config, src randsource.Source) (*Engine, error) {
 		per:    (1.0 - cfg.SpecialProb) / float64(len(others)),
 	}
 
+	// 号码池本身与模式无关，始终按号码升序建好。
+	for n := cfg.MinNumber; n <= cfg.MaxNumber; n++ {
+		e.pool = append(e.pool, n)
+	}
+
+	// 累积分布表只有有偏模式才需要。
+	if !cfg.Weighted() {
+		return e, nil
+	}
+
 	// 按号码升序铺开累积分布表。号码池很小（个位数），线性扫描比二分更快。
 	acc := 0.0
 	for n := cfg.MinNumber; n <= cfg.MaxNumber; n++ {
@@ -85,7 +102,6 @@ func NewWithSource(cfg config.Config, src randsource.Source) (*Engine, error) {
 			w = cfg.SpecialProb
 		}
 		acc += w
-		e.pool = append(e.pool, n)
 		e.cum = append(e.cum, acc)
 	}
 	// 抹掉浮点累加误差：保证「最后一个桶」一定接住 [x, 1) 的尾部，
@@ -112,16 +128,31 @@ func (e *Engine) Reconfigure(cfg config.Config) (*Engine, error) {
 func (e *Engine) Weights() []float64 {
 	w := make([]float64, 0, e.cfg.PoolSize())
 	for _, n := range e.pool {
-		if n == e.cfg.SpecialNumber {
+		switch {
+		case !e.cfg.Weighted():
+			// 均匀随机：每个号码等概率
+			w = append(w, 1.0/float64(len(e.pool)))
+		case n == e.cfg.SpecialNumber:
 			w = append(w, e.cfg.SpecialProb)
-		} else {
+		default:
 			w = append(w, e.per)
 		}
 	}
 	return w
 }
 
-// pick 按累积概率做一次加权抽样。
+// Weighted 报告当前引擎是否处于有偏模式（特殊号码加权 + 整轮必中）。
+func (e *Engine) Weighted() bool { return e.cfg.Weighted() }
+
+// pickUniform 在号码池里等概率取一个号码。
+//
+// 这是默认路径：直接用随机源的 Intn，每个号码概率完全相同，
+// 不做任何加权、不做任何整轮筛选。
+func (e *Engine) pickUniform() int {
+	return e.pool[e.src.Intn(len(e.pool))]
+}
+
+// pick 按累积概率做一次加权抽样（有偏模式专用）。
 func (e *Engine) pick() int {
 	x := e.src.Float64()
 	for i, c := range e.cum {
@@ -133,11 +164,30 @@ func (e *Engine) pick() int {
 	return e.pool[len(e.pool)-1]
 }
 
-// Draw 抽一轮并返回结果。
+// DrawUniform 生成一轮**均匀随机**序列：每个号码等概率，无任何加权、无整轮筛选。
+//
+// 这是默认路径。九次抽取彼此独立，因此某一轮里没有任何号码是「保证出现」的 ——
+// 某个号码一轮里一次都没出现是正常现象（概率约 (7/8)^9 ≈ 30%）。
+func (e *Engine) DrawUniform() *Result {
+	items := make([]int, e.cfg.DrawCount)
+	for i := range items {
+		items[i] = e.pickUniform()
+	}
+	return &Result{Items: items, Attempts: 1}
+}
+
+// Draw 抽一轮并返回结果（**有偏模式**专用）。
+//
+// 只有在 cfg.Weighted() 为真时才应该调用它。均匀随机请用 DrawUniform。
 //
 // 重抽循环有一个容易踩的坑：单纯「重抽直到命中」在参数过紧时可能永远不结束。
 // 因此这里用 MaxAttempts 硬上限兜底，超限后走构造式兜底，保证接口永不挂起。
 func (e *Engine) Draw() *Result {
+	if !e.cfg.Weighted() {
+		// 没启用有偏模式时，Draw 就是均匀随机，避免调用方误以为结果被筛选过。
+		return e.DrawUniform()
+	}
+
 	for i := 1; i <= e.cfg.MaxAttempts; i++ {
 		items, counts := e.round()
 		if e.accept(counts) {
@@ -167,11 +217,25 @@ func (e *Engine) DrawChecked() (*Result, error) {
 
 // DrawSequence 生成一轮号码序列，直接返回切片。
 //
-// 这是给「一次只交付一个号码」的接口用的：整轮在第一次请求时就一次性生成好，
-// 之后的每次点击只是按顺序取下一个。这样做的关键好处是
-// 约束（特殊号码必须是唯一最高票）在生成时就已满足，
-// 绝不会出现「抽到第九个才发现凑不齐、只能让用户重来」的尴尬。
+// 按配置自动选择算法：
+//   - 默认（均匀随机）：九次独立等概率抽取；
+//   - 有偏模式（SPECIAL_NUMBER 非 0）：加权抽样 + 整轮必中。
+//
+// 无论哪种，整轮都是**一次性生成好**再逐个交付，因此不会出现
+// 「抽到第九个才发现凑不齐、只能让用户重来」的情况。
 func (e *Engine) DrawSequence() []int {
+	if !e.cfg.Weighted() {
+		return e.DrawUniform().Items
+	}
+	return e.DrawSequenceBiased()
+}
+
+// DrawSequenceBiased 生成一轮满足「特殊号码唯一最高票」的序列（有偏模式）。
+//
+// 这个方法保留下来是因为它是这个项目最初的算法：加权抽样后做整轮校验，
+// 不满足就整轮重抽，超限则构造式兜底。完整的历史实现在
+// docs/legacy-biased-algorithm.md 里另有一份备份。
+func (e *Engine) DrawSequenceBiased() []int {
 	res, err := e.DrawChecked()
 	if err != nil {
 		// 参数非法时 Validate 已经拦住了；真走到这里说明出现了意料之外的
@@ -198,7 +262,7 @@ func (e *Engine) DrawBatch(n int) []*Result {
 	return out
 }
 
-// round 执行一轮完整抽取，返回序列和票数统计。
+// round 执行一轮完整抽取（有偏模式：按权重抽），返回序列和票数统计。
 //
 // 票数统计用 map 而不是先开一个长度为池大小的计数切片：
 // 号码池很小（个位数），两者耗时相当（约 900ns），但切片版本每次多一次分配、
@@ -214,9 +278,14 @@ func (e *Engine) round() ([]int, map[int]int) {
 	return items, counts
 }
 
-// accept 判定：特殊号码必须出现过，且严格多于其他任何号码。
-// 这是整个产品的核心约束 —— 「一轮九次，一轮一定命中 4」。
+// accept 判定（有偏模式专用）：特殊号码必须出现过，且严格多于其他任何号码。
+//
+// 这是**有偏模式**的核心约束 —— 启用后「一轮九次，一轮一定命中该号码」。
+// 均匀随机模式不调用它，因此默认配置下没有任何号码享有这种保证。
 func (e *Engine) accept(counts map[int]int) bool {
+	if !e.cfg.Weighted() {
+		return true
+	}
 	c := counts[e.cfg.SpecialNumber]
 	if c == 0 {
 		return false
@@ -414,9 +483,17 @@ func (e *Engine) Stats(items []int) Stats {
 			topNumber, topCount = n, c
 		}
 	}
+
+	// 均匀随机模式下没有「特殊号码」这个概念，因此 SpecialCount 恒为 0，
+	// 避免调用方把它误解成某种保证。
+	specialCount := 0
+	if e.cfg.Weighted() {
+		specialCount = counts[e.cfg.SpecialNumber]
+	}
+
 	return Stats{
 		Counts:       counts,
-		SpecialCount: counts[e.cfg.SpecialNumber],
+		SpecialCount: specialCount,
 		TopNumber:    topNumber,
 		TopCount:     topCount,
 	}

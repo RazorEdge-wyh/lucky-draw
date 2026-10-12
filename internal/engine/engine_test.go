@@ -10,9 +10,20 @@ import (
 	"github.com/RazorEdge-wyh/lucky-draw/internal/randsource"
 )
 
-// defaultCfg 与需求给定的默认参数保持一致：
-// 一轮 9 次、号码 1..8、特殊号码 4、特殊号码权重 15%。
-func defaultCfg() config.Config { return config.Default() }
+// biasedCfg 是**原来的有偏算法**参数：一轮 9 次、号码 1..8、特殊号码 4、
+// 权重 15%，整轮强制「4 是唯一最高票」。
+//
+// 注意这已经不是默认值了：config.Default() 现在是均匀随机（SpecialNumber = 0）。
+// 这些测试仍然保留，用来守护那条被备份下来的老路径。
+func biasedCfg() config.Config {
+	cfg := config.Default()
+	cfg.SpecialNumber = 4
+	cfg.SpecialProb = 0.15
+	return cfg
+}
+
+// uniformCfg 是当前默认配置：均匀随机，没有任何号码享有特权。
+func uniformCfg() config.Config { return config.Default() }
 
 // newTestEngine 构造一个用确定性随机源驱动的引擎，便于复现。
 func newTestEngine(t *testing.T, cfg config.Config, seed uint64) *Engine {
@@ -28,7 +39,7 @@ func newTestEngine(t *testing.T, cfg config.Config, seed uint64) *Engine {
 // 无论怎么抽，特殊号码都必须出现，且必须是唯一最高票。
 func TestDrawAlwaysSatisfiesConstraint(t *testing.T) {
 	const rounds = 20000
-	e := newTestEngine(t, defaultCfg(), 20260214)
+	e := newTestEngine(t, biasedCfg(), 20260214)
 
 	for i := 0; i < rounds; i++ {
 		res := e.Draw()
@@ -59,7 +70,7 @@ func TestDrawAlwaysSatisfiesConstraint(t *testing.T) {
 // 4 号应占约 15%，其余 7 个号码各占约 (85/7)% ≈ 12.14%。
 func TestPickFollowsWeights(t *testing.T) {
 	const n = 400000
-	e := newTestEngine(t, defaultCfg(), 7)
+	e := newTestEngine(t, biasedCfg(), 7)
 
 	hist := make(map[int]int, 8)
 	for i := 0; i < n; i++ {
@@ -95,7 +106,7 @@ func TestPickFollowsWeights(t *testing.T) {
 // TestAcceptProbMatchesSimulation 检验解析解与蒙特卡洛实测一致。
 // 这个测试保证「期望重抽轮数」这个对外展示的指标是真的。
 func TestAcceptProbMatchesSimulation(t *testing.T) {
-	cfg := defaultCfg()
+	cfg := biasedCfg()
 	e := newTestEngine(t, cfg, 99)
 
 	theory := e.AcceptProb()
@@ -135,7 +146,7 @@ func TestAcceptProbMatchesSimulation(t *testing.T) {
 // TestFallbackProducesValidResult 强制走兜底分支：
 // 把 MaxAttempts 设为 1 且权重为 0，自然命中概率为 0，必然进入构造逻辑。
 func TestFallbackProducesValidResult(t *testing.T) {
-	cfg := defaultCfg()
+	cfg := biasedCfg()
 	cfg.SpecialProb = 0 // 特殊号码永远抽不到
 	cfg.MaxAttempts = 1 // 立刻触发兜底
 
@@ -174,7 +185,7 @@ func TestFallbackProducesValidResult(t *testing.T) {
 // 而那种配置已经被 config.Validate 提前拒绝，属于双保险。
 func TestFeasibilityAcrossPoolSizes(t *testing.T) {
 	// 号码池 1..2、特殊号码 1：仍然可行（k=9 时其他号码全 0 次）。
-	cfg := defaultCfg()
+	cfg := biasedCfg()
 	cfg.MinNumber, cfg.MaxNumber, cfg.SpecialNumber = 1, 2, 1
 	e := newTestEngine(t, cfg, 1)
 	k, ok := e.feasibleK()
@@ -194,7 +205,7 @@ func TestFeasibilityAcrossPoolSizes(t *testing.T) {
 	}
 
 	// 号码池只有一个号码（others 为空）：构造阶段就应当被拒绝。
-	cfg2 := defaultCfg()
+	cfg2 := biasedCfg()
 	cfg2.MinNumber, cfg2.MaxNumber, cfg2.SpecialNumber = 4, 4, 4
 	if _, err := NewWithSource(cfg2, randsource.NewSeeded(1)); err == nil {
 		t.Error("号码池只有一个号码时配置应当被 Validate 拒绝")
@@ -204,7 +215,7 @@ func TestFeasibilityAcrossPoolSizes(t *testing.T) {
 // TestDrawSequenceIsNineLongAndFourWins 校验提供给「一次只交付一个号码」接口的
 // DrawSequence：长度等于一轮次数，且满足核心约束。
 func TestDrawSequenceIsNineLongAndFourWins(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 2024)
+	e := newTestEngine(t, biasedCfg(), 2024)
 
 	for i := 0; i < 300; i++ {
 		seq := e.DrawSequence()
@@ -236,8 +247,8 @@ func TestDrawSequenceIsNineLongAndFourWins(t *testing.T) {
 // 这是「可复现」承诺的基础（也用于事后审计对账）。
 func TestDeterministicWithSameSeed(t *testing.T) {
 	const rounds = 50
-	e1 := newTestEngine(t, defaultCfg(), 555)
-	e2 := newTestEngine(t, defaultCfg(), 555)
+	e1 := newTestEngine(t, biasedCfg(), 555)
+	e2 := newTestEngine(t, biasedCfg(), 555)
 
 	for i := 0; i < rounds; i++ {
 		r1, r2 := e1.Draw(), e2.Draw()
@@ -250,7 +261,7 @@ func TestDeterministicWithSameSeed(t *testing.T) {
 	}
 
 	// 不同种子应当产生不同序列（否则随机源没有真正被使用）。
-	e3 := newTestEngine(t, defaultCfg(), 556)
+	e3 := newTestEngine(t, biasedCfg(), 556)
 	same := 0
 	for i := 0; i < rounds; i++ {
 		if fmt.Sprint(e1.Draw().Items) == fmt.Sprint(e3.Draw().Items) {
@@ -297,7 +308,7 @@ func TestCryptoSourceCoversRange(t *testing.T) {
 // 并发安全的，拿它跑并发测试会被竞态检测器正确抓住（那是测试写错了，
 // 不是引擎有问题）。Crypto 没有内部状态，可以安全共享。
 func TestEngineIsConcurrencySafe(t *testing.T) {
-	concEngine, err := NewWithSource(defaultCfg(), randsource.New())
+	concEngine, err := NewWithSource(biasedCfg(), randsource.New())
 	if err != nil {
 		t.Fatalf("构造并发测试引擎失败: %v", err)
 	}
@@ -330,7 +341,7 @@ func TestEngineIsConcurrencySafe(t *testing.T) {
 
 // TestDrawBatchAndStats 检验批量接口与统计口径。
 func TestDrawBatchAndStats(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 31337)
+	e := newTestEngine(t, biasedCfg(), 31337)
 
 	if got := e.DrawBatch(0); got != nil {
 		t.Errorf("DrawBatch(0) 应返回 nil，实际 %v", got)
@@ -367,7 +378,7 @@ func TestDrawBatchAndStats(t *testing.T) {
 
 // TestWeightsReflectExtraNumbers 确认号码池上界变化会摊薄非特殊号码的权重。
 func TestWeightsReflectExtraNumbers(t *testing.T) {
-	cfg := defaultCfg()
+	cfg := biasedCfg()
 	cfg.MaxNumber = 20 // 1..20 去掉特殊号码 4，others 共 19 个
 
 	e := newTestEngine(t, cfg, 1)
@@ -410,15 +421,15 @@ func numberRangeOf(cfg config.Config) []int {
 
 // TestReconfigureRejectsPoolChange 号码池结构不允许在变体引擎里被改动。
 func TestReconfigureRejectsPoolChange(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 1)
+	e := newTestEngine(t, biasedCfg(), 1)
 
-	bad := defaultCfg()
+	bad := biasedCfg()
 	bad.MaxNumber = 12
 	if _, err := e.Reconfigure(bad); err == nil {
 		t.Error("改变号码池上界应当被拒绝")
 	}
 
-	good := defaultCfg()
+	good := biasedCfg()
 	good.DrawCount = 11
 	good.SpecialProb = 0.2
 	variant, err := e.Reconfigure(good)
@@ -433,7 +444,7 @@ func TestReconfigureRejectsPoolChange(t *testing.T) {
 // TestPickCoversAllNumbers 抽样必须能取到号码池里的每一个号码，
 // 避免累积概率表写错导致某些号码永远抽不到。
 func TestPickCoversAllNumbers(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 6)
+	e := newTestEngine(t, biasedCfg(), 6)
 	seen := make(map[int]bool)
 	for i := 0; i < 5000; i++ {
 		seen[e.pick()] = true
@@ -447,7 +458,7 @@ func TestPickCoversAllNumbers(t *testing.T) {
 
 // BenchmarkDraw 衡量一轮抽奖的开销，含内部重抽。
 func BenchmarkDraw(b *testing.B) {
-	cfg := defaultCfg()
+	cfg := biasedCfg()
 	e, err := NewWithSource(cfg, randsource.New())
 	if err != nil {
 		b.Fatal(err)
@@ -462,7 +473,7 @@ func BenchmarkDraw(b *testing.B) {
 
 // BenchmarkPick 衡量单次加权抽样的开销。
 func BenchmarkPick(b *testing.B) {
-	e, err := NewWithSource(defaultCfg(), randsource.New())
+	e, err := NewWithSource(biasedCfg(), randsource.New())
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -12,12 +12,44 @@ func TestDefaultIsConsistent(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("默认配置未通过校验: %v", err)
 	}
-	// 默认值与需求给定的一致。
-	if cfg.DrawCount != 9 || cfg.SpecialNumber != 4 || cfg.SpecialProb != 0.15 {
-		t.Errorf("默认参数与需求不符: %+v", cfg)
+	// 默认是**均匀随机**：SpecialNumber = 0 表示不启用任何有偏规则。
+	if cfg.SpecialNumber != 0 {
+		t.Errorf("默认应为均匀随机（SpecialNumber=0），实际 %d", cfg.SpecialNumber)
+	}
+	if cfg.Weighted() {
+		t.Error("默认配置不应处于有偏模式")
+	}
+	if cfg.DrawCount != 9 {
+		t.Errorf("默认一轮应为 9 次，实际 %d", cfg.DrawCount)
 	}
 	if cfg.MinNumber != 1 || cfg.MaxNumber != 8 {
-		t.Errorf("默认号码池应与需求一致: %d..%d", cfg.MinNumber, cfg.MaxNumber)
+		t.Errorf("默认号码池应为 1..8，实际 %d..%d", cfg.MinNumber, cfg.MaxNumber)
+	}
+}
+
+// TestWeightedModeOptIn 有偏模式必须显式开启，且开启后 Weighted() 为真。
+func TestWeightedModeOptIn(t *testing.T) {
+	cfg := Default()
+	cfg.SpecialNumber = 4
+	if !cfg.Weighted() {
+		t.Error("设置了池内特殊号码后应处于有偏模式")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("有偏模式配置应当合法: %v", err)
+	}
+
+	// 池外的号码应当被拒绝。
+	bad := Default()
+	bad.SpecialNumber = 99
+	if err := bad.Validate(); err == nil {
+		t.Error("池外的 SPECIAL_NUMBER 应当被拒绝")
+	}
+
+	// 负数同样应被拒绝。
+	neg := Default()
+	neg.SpecialNumber = -1
+	if err := neg.Validate(); err == nil {
+		t.Error("负数 SPECIAL_NUMBER 应当被拒绝")
 	}
 }
 
@@ -99,25 +131,39 @@ func TestEnvInvalidFallsBackToDefault(t *testing.T) {
 	}
 }
 
-// TestOthersAndPoolSize 号码池辅助方法要正确排除特殊号码。
+// TestOthersAndPoolSize 均匀随机模式下 Others() 应返回完整号码池；
+// 有偏模式下才排除特殊号码。
 func TestOthersAndPoolSize(t *testing.T) {
+	// 均匀随机：没有特殊号码，池子就是全部 8 个号码。
 	cfg := Default()
 	others := cfg.Others()
-	if len(others) != 7 {
-		t.Fatalf("其他号码应有 7 个，实际 %d: %v", len(others), others)
+	if len(others) != 8 {
+		t.Fatalf("均匀随机模式下 others 应为完整的 8 个号码，实际 %d: %v", len(others), others)
 	}
-	for _, n := range others {
-		if n == cfg.SpecialNumber {
-			t.Errorf("others 不应包含特殊号码 %d", n)
-		}
-	}
-	want := []int{1, 2, 3, 5, 6, 7, 8}
-	for i, n := range want {
+	for i, n := range []int{1, 2, 3, 4, 5, 6, 7, 8} {
 		if others[i] != n {
 			t.Errorf("others[%d] 应为 %d，实际 %d（需保持升序）", i, n, others[i])
 		}
 	}
 	if cfg.PoolSize() != 8 {
 		t.Errorf("号码池大小应为 8，实际 %d", cfg.PoolSize())
+	}
+
+	// 有偏模式：排除特殊号码 4。
+	biased := Default()
+	biased.SpecialNumber = 4
+	bOthers := biased.Others()
+	if len(bOthers) != 7 {
+		t.Fatalf("有偏模式下其他号码应有 7 个，实际 %d: %v", len(bOthers), bOthers)
+	}
+	for _, n := range bOthers {
+		if n == 4 {
+			t.Error("有偏模式的 others 不应包含特殊号码 4")
+		}
+	}
+	for i, n := range []int{1, 2, 3, 5, 6, 7, 8} {
+		if bOthers[i] != n {
+			t.Errorf("有偏模式 others[%d] 应为 %d，实际 %d", i, n, bOthers[i])
+		}
 	}
 }

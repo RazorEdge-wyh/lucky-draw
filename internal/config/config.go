@@ -13,31 +13,46 @@ import (
 type Config struct {
 	// DrawCount 一轮抽多少次（默认 9）。
 	DrawCount int
-	// SpecialNumber 特殊号码，即奖品对应的那个号码（默认 4）。
+	// SpecialNumber 是「有偏模式」的特殊号码。
+	//
+	// 0（默认）表示**均匀随机模式**：每个号码等概率，不做任何整轮筛选。
+	// 设为号码池内的某个号码则启用**有偏模式**：该号码按 SpecialProb 加权，
+	// 并且整轮必须满足「它是唯一最高票」，否则整轮重抽。
+	//
+	// 也就是说 0 是「真随机」，非 0 是「必定命中」。
 	SpecialNumber int
-	// SpecialProb 特殊号码单次命中的概率权重（默认 0.15）。
+	// SpecialProb 是有偏模式下特殊号码的单次命中权重（默认 0.15）。
+	// 均匀随机模式下忽略此项。
 	SpecialProb float64
 	// MinNumber 号码池下界（默认 1）。
 	MinNumber int
 	// MaxNumber 号码池上界（默认 8）。
 	MaxNumber int
-	// MaxAttempts 内部整轮重抽的上限（默认 5000）。
+	// MaxAttempts 有偏模式内部整轮重抽的上限（默认 5000）。
 	MaxAttempts int
 	// Port HTTP 监听端口（默认 8080）。
 	Port string
 }
 
 // Default 返回不带任何环境变量时的默认配置。
+//
+// 默认值是**均匀随机**：SpecialNumber = 0 表示不启用任何有偏规则。
+// 每个号码等概率，一轮九次，没有任何号码享有特权。
 func Default() Config {
 	return Config{
 		DrawCount:     9,
-		SpecialNumber: 4,
+		SpecialNumber: 0, // 0 = 均匀随机（真随机）
 		SpecialProb:   0.15,
 		MinNumber:     1,
 		MaxNumber:     8,
 		MaxAttempts:   5000,
 		Port:          "8080",
 	}
+}
+
+// Weighted 报告当前是否启用有偏模式（特殊号码加权 + 整轮必中）。
+func (c Config) Weighted() bool {
+	return c.SpecialNumber >= c.MinNumber && c.SpecialNumber <= c.MaxNumber
 }
 
 // Load 从环境变量读取配置，未设置的项使用默认值。
@@ -63,9 +78,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("号码池至少要有 2 个号码，当前 [%d, %d] 只有 %d 个",
 			c.MinNumber, c.MaxNumber, c.MaxNumber-c.MinNumber+1)
 	}
-	if c.SpecialNumber < c.MinNumber || c.SpecialNumber > c.MaxNumber {
+	// 只有启用有偏模式时才校验特殊号码；0 表示均匀随机，是合法默认值。
+	if c.Weighted() && (c.SpecialNumber < c.MinNumber || c.SpecialNumber > c.MaxNumber) {
 		return fmt.Errorf("SPECIAL_NUMBER(%d) 必须落在 [MIN_NUMBER, MAX_NUMBER] = [%d, %d] 区间内",
 			c.SpecialNumber, c.MinNumber, c.MaxNumber)
+	}
+	if c.SpecialNumber < 0 || c.SpecialNumber > c.MaxNumber {
+		return fmt.Errorf("SPECIAL_NUMBER(%d) 非法：只能是 0（均匀随机）或号码池内的号码",
+			c.SpecialNumber)
 	}
 	if c.SpecialProb < 0 || c.SpecialProb > 1 {
 		return fmt.Errorf("SPECIAL_PROB(%v) 必须落在 [0, 1] 区间内", c.SpecialProb)
@@ -83,10 +103,12 @@ func (c Config) Validate() error {
 }
 
 // Others 返回号码池中除特殊号码以外的全部号码，升序。
+//
+// 均匀随机模式下 SpecialNumber 为 0（不在池内），因此会返回完整号码池。
 func (c Config) Others() []int {
-	others := make([]int, 0, c.MaxNumber-c.MinNumber)
+	others := make([]int, 0, c.MaxNumber-c.MinNumber+1)
 	for n := c.MinNumber; n <= c.MaxNumber; n++ {
-		if n != c.SpecialNumber {
+		if !c.Weighted() || n != c.SpecialNumber {
 			others = append(others, n)
 		}
 	}

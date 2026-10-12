@@ -8,7 +8,6 @@
   var resultEl = document.getElementById("result");
 
   var TOTAL = 9;      // 一轮九次，与后端 DRAW_COUNT 一致；首屏会用响应里的 total 校正
-  var SPECIAL = 4;    // 特殊号码，仅用于抽满后的小结统计
   var poolSize = TOTAL; // 号码池大小，仅用于滚动动画里生成临时数字
   var busy = false;
   var round = 0;      // 当前轮数
@@ -42,23 +41,22 @@
       resultEl.appendChild(chip);
     }
 
-    // 抽满才给小结：这一轮 4 出现了几次、其他号码最多几次
+    // 抽满才给小结：本轮出现了几个不同的号码、最多重复了几次
     if (justFinished) {
       var counts = {};
       for (var j = 0; j < items.length; j++) {
         counts[items[j]] = (counts[items[j]] || 0) + 1;
       }
-      var specialCount = counts[SPECIAL] || 0;
-      var otherMax = 0;
+      var distinct = Object.keys(counts).length;
+      var maxRepeat = 0;
       Object.keys(counts).forEach(function (k) {
-        var n = Number(k);
-        if (n !== SPECIAL && counts[k] > otherMax) { otherMax = counts[k]; }
+        if (counts[k] > maxRepeat) { maxRepeat = counts[k]; }
       });
 
       var sum = document.createElement("div");
       sum.className = "summary";
-      sum.innerHTML = "本轮 " + items.length + " 次 · " +
-        SPECIAL + " 出现 <b>" + specialCount + "</b> 次 · 其他号码最多 " + otherMax + " 次";
+      sum.innerHTML = "本轮 " + items.length + " 次 · 出现 <b>" + distinct +
+        "</b> 个不同号码 · 最多重复 " + maxRepeat + " 次";
       resultEl.appendChild(sum);
     }
   }

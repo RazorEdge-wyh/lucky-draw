@@ -31,6 +31,12 @@ param(
     [string]$CommitMessage = 'feat: initial commit of lucky-draw lottery service',
     [string]$CommitAuthorName = 'lucky-draw',
     [string]$CommitAuthorEmail = '',
+    [string]$Tag = '',
+    [string]$TagMessage = '',
+    # Optional: create the tag at this existing commit instead of the new one.
+    # Used to mark a historical commit (e.g. the last version that still
+    # contained the original biased algorithm).
+    [string]$TagAt = '',
     [switch]$DryRun
 )
 
@@ -324,6 +330,37 @@ if ($defaultBranch -ne $Branch) {
     $null = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName" -Headers $Headers `
         -Method Patch -Body $patch -ContentType 'application/json; charset=utf-8'
     Write-Ok 'Default branch switched'
+}
+
+# ---------------------------------------------------------------------------
+# 5b. Optional annotated tag (useful for marking milestones, e.g. the
+#     commit that still contained the original biased algorithm)
+# ---------------------------------------------------------------------------
+
+if ($Tag) {
+    # Tag an existing commit when -TagAt is given, otherwise tag the new commit.
+    $tagTarget = $commit.sha
+    if ($TagAt) { $tagTarget = $TagAt }
+    Write-Step "Creating tag $Tag -> $($tagTarget.Substring(0, 10))"
+
+    $tagBody = @{
+        tag = $Tag
+        message = if ($TagMessage) { $TagMessage } else { "Release $Tag" }
+        object = $tagTarget
+        type = 'commit'
+        tagger = @{
+            name = $CommitAuthorName
+            email = $CommitAuthorEmail
+            date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    $tagObj = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/tags" -Method Post -Body $tagBody
+    Write-Ok "tag object = $($tagObj.sha)"
+
+    $tagRefBody = @{ ref = "refs/tags/$Tag"; sha = $tagObj.sha } | ConvertTo-Json -Compress
+    $null = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/refs" -Method Post -Body $tagRefBody
+    Write-Ok "tag $Tag created"
 }
 
 # ---------------------------------------------------------------------------

@@ -163,7 +163,7 @@ func TestBinomKnownValues(t *testing.T) {
 // 这是最有说服力的检验方式 —— 不依赖任何组合恒等式，直接用真实随机序列说话。
 // 早期实现漏掉了多项式系数，k=2/3/4 各项会偏小几十倍，这个测试会立刻发现。
 func TestAcceptProbPerKAgainstSamples(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 987654321)
+	e := newTestEngine(t, biasedCfg(), 987654321)
 	const rounds = 400000
 	n, m := e.cfg.DrawCount, len(e.others)
 	p, q := e.cfg.SpecialProb, e.per
@@ -224,7 +224,7 @@ func TestAcceptProbAgainstExactEnumeration(t *testing.T) {
 		{4, 0.3},
 		{5, 0.15},
 	} {
-		cfg := defaultCfg()
+		cfg := biasedCfg()
 		cfg.DrawCount = tc.drawCount
 		cfg.SpecialProb = tc.prob
 		e := newTestEngine(t, cfg, 1)
@@ -305,7 +305,7 @@ func logFact(n int) float64 {
 // 并断言它与「平均重抽轮数」的量级一致 —— 这个数字会展示给玩家，
 // 因此必须是可信的。实测约 0.111（见 TestAcceptProbMatchesSimulation）。
 func TestAcceptProbDefaultValue(t *testing.T) {
-	e := newTestEngine(t, defaultCfg(), 1)
+	e := newTestEngine(t, biasedCfg(), 1)
 	got := e.AcceptProb()
 	t.Logf("默认参数单轮命中率 = %.10f，期望重抽 %.2f 轮", got, 1/got)
 

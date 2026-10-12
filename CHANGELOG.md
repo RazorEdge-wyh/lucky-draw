@@ -2,6 +2,61 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.0] - 2026-10-12
+
+### 变更（破坏性）：默认算法改为真正的均匀随机
+
+原来默认是「加权抽样 + 整轮必中 4」的有偏实现，现在默认改为**真随机**：
+
+- **默认均匀随机**：号码池 1..8，每个号码概率完全相等（各 1/8）。
+  九次抽取彼此独立，没有任何号码保证出现。
+- **有偏模式改为显式开启**：`config.Default()` 的 `SpecialNumber` 现在是 `0`；
+  设为号码池内的号码才回到老行为。新增 `config.Weighted()` 判定当前模式。
+- **`Others()` 语义随之调整**：均匀随机下返回完整号码池。
+- **`Stats.SpecialCount`** 在均匀随机下恒为 `0`，避免被误解成「有保底号码」。
+- **结果区小结改文案**：从「4 出现 N 次 · 其他号码最多 N 次」改为
+  「出现 N 个不同号码 · 最多重复 N 次」——均匀随机下前者已无意义。
+
+### 变更（新 API）
+
+- `engine.DrawUniform()`：均匀随机一轮，默认路径。
+- `engine.DrawSequence()`：按配置自动选择算法（均匀 / 有偏）。
+- `engine.DrawSequenceBiased()`：显式走有偏路径（保留原名语义）。
+- `engine.Draw()`：现在会自动判断模式 —— 未启用有偏时退化为均匀随机，
+  避免调用方误以为结果被筛选过。
+- `engine.Weights()`：均匀随机下返回相等的 1/8。
+
+### 新增：原始算法完整备份
+
+老算法**没有被删除**，而是分层备份并持续受测试保护：
+
+| 备份层 | 位置 |
+| --- | --- |
+| 独立实现 | `internal/engine/biased_backup.go`（自包含的 `BiasedGenerator`） |
+| 引擎内老路径 | `engine.DrawSequenceBiased()` |
+| 环境变量开关 | `SPECIAL_NUMBER=<号码>` |
+| 完整文档 | `docs/legacy-biased-algorithm.md`（推导 + 概率表 + 4 种恢复方式） |
+| 测试守护 | `internal/engine/biased_backup_test.go`（5 个测试） |
+
+备份算法的行为被测试固定下来：200 轮里 4 必须出现且唯一最高票、
+结果分布仍是 37.15% / 8.97%、兜底仍取最小可行 k=2。
+
+### 新增：真随机的守护测试
+
+- `TestUniformRoundIsFairAndComplete`：400 轮 × 9 次抽样，每个号码占比必须落在
+  1/8 ± 0.04 内，且 4 的占比必须**低于 20%**（重新引入偏向就会失败）。
+- `TestUniformDrawDistribution`：40 万次抽样的分布校验。
+- `TestUniformWeightsAreEqual`、`TestUniformSpecialCountIsZero`。
+- `TestBiasedAndUniformDiffer`：证明两种算法确实不同
+  （均匀模式下约 30% 的轮次完全不出 4）。
+- `TestConfigDefaultIsUniformContract`：把「默认必须真随机」固定成契约。
+
+### 移除
+
+- `scripts/check-site.ps1`（PowerShell 5.1 的 ANSI 解码问题让它不可靠，
+  改用 `scripts/check-site-js.js`；本机无 Node 时用无头浏览器验证）。
+- 静态页里不再有 `specialNumber` / `specialProb` / `isAccepted` / `fallback` 等有偏逻辑。
+
 ## [2.0.0] - 2026-10-12
 
 ### 变更（破坏性）
