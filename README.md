@@ -41,7 +41,24 @@ Go · 零依赖 · 单二进制部署
 
 ## 🚀 快速开始
 
-需要 Go 1.22+。
+这个仓库里有两份**算法完全相同**的实现，按需要选一个：
+
+| | 静态版（`site/`） | 服务端版（Go） |
+| --- | --- | --- |
+| 运行位置 | 浏览器，纯前端 | Go 服务 |
+| 随机源 | `crypto.getRandomValues()` | `crypto/rand` |
+| 部署 | GitHub Pages（本仓库已配置） | 任意支持 Docker 的平台 |
+| 适合 | 分享链接给别人用 | 嵌入自己的系统、需要隐藏算法 |
+
+### 静态版
+
+直接打开 <https://razoredge-wyh.github.io/lucky-draw/>，或本地起个静态服务器：
+
+```bash
+python3 -m http.server 8000 --directory site
+```
+
+### 服务端版（Go 1.22+）
 
 ```bash
 git clone https://github.com/RazorEdge-wyh/lucky-draw.git
@@ -74,6 +91,8 @@ docker run --rm -p 8080:8080 lucky-draw
 ---
 
 ## 📡 接口
+
+以下接口属于**服务端版**；静态版跑在浏览器里，没有 HTTP 接口。
 
 只有三个，够用就好。
 
@@ -201,7 +220,8 @@ go test -bench=. -benchmem ./internal/engine/
 
 ```
 .
-├── main.go                            # 入口：配置、启动、优雅关闭、-healthcheck
+├── site/index.html                    # 静态版：单文件，含算法与动画（GitHub Pages 发布这个）
+├── main.go                            # 服务端版入口：配置、启动、优雅关闭、-healthcheck
 ├── internal/
 │   ├── config/config.go               # 环境变量配置与校验
 │   ├── randsource/randsource.go       # crypto/rand 随机源（另有可复现的测试实现）
@@ -211,8 +231,23 @@ go test -bench=. -benchmem ./internal/engine/
 │       ├── assets.go
 │       └── web/{index.html,app.js}    # 编译进二进制
 ├── Dockerfile / docker-compose.yml
-└── .github/workflows/ci.yml
+└── .github/workflows/
+    ├── ci.yml                         # 格式化 + 静态检查 + 竞态测试 + 冒烟 + 镜像构建
+    └── deploy-pages.yml               # 把 site/ 发布到 GitHub Pages
 ```
+
+### 两份实现的一致性
+
+静态版不是"简化版"，而是把同一套逻辑照搬到了浏览器：同样的权重、同样的整轮校验、
+同样的拒绝采样消偏、同样的兜底构造。实测后验分布一致：
+
+| 号码 | 服务端版（Go，实测） | 静态版（JS 逻辑复算） |
+| --- | --- | --- |
+| 4（特殊） | 37.15% | 37.18% |
+| 1、2、3、5、6、7、8 | 各约 9.0% | 各约 9.0% |
+
+唯一的区别是**算法在静态版里是公开可见的**（浏览器里跑，代码必然可读）。
+如果你需要把抽奖逻辑藏起来，请用服务端版。
 
 ### 随机源
 

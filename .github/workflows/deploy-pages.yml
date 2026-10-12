@@ -1,0 +1,55 @@
+name: Deploy site to GitHub Pages
+
+# 站点是纯静态的（算法跑在浏览器里），因此直接把 site/ 目录发布成 Pages 产物，
+# 不需要构建步骤。这与本账号其他项目的部署方式保持一致：
+# configure-pages -> upload-pages-artifact -> deploy-pages。
+#
+# 服务端版本（Go）仍在仓库里，可自行部署到支持 Docker 的平台；
+# 它和这个静态版使用完全相同的抽奖算法。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一次 Pages 部署，后提交的覆盖先提交的
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验产物存在且关键内容完整
+        run: |
+          test -f site/index.html || { echo "缺少 site/index.html"; exit 1; }
+          grep -q "随机数生成器" site/index.html
+          grep -q "crypto.getRandomValues" site/index.html
+          echo "site/index.html 校验通过（$(wc -c < site/index.html) 字节）"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
