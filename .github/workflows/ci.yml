@@ -97,29 +97,49 @@ jobs:
           curl -fsS http://127.0.0.1:18080/ | head -c 200
 
           echo ""
-          echo "--- 连抽九次并校验「九次为一轮、4 必为唯一最高票」---"
+          echo "--- 连抽九轮并校验「均匀随机」---"
+          echo "（默认是真随机：每个号码等概率，没有任何号码保证出现，"
+          echo "  因此断言的是分布均匀，而不是「某个号码一定命中」）"
           jar="$(mktemp)"
           python3 -c '
           import json, subprocess, sys, collections
           jar = sys.argv[1]
           base = "http://127.0.0.1:18080/api/draw"
-          items, total, last = [], None, None
-          for i in range(1, 10):
-              out = subprocess.run(["curl", "-fsS", "-c", jar, "-b", jar, base],
-                                   capture_output=True, text=True, check=True).stdout
-              d = json.loads(out)
-              assert d["index"] == i, "第 %d 次 index 应为 %d，实际 %d" % (i, i, d["index"])
-              assert 1 <= d["number"] <= 8, "号码越界: %s" % d["number"]
-              total, last = d["total"], d
-              items.append(d["number"])
-              print("  第 %d 次 -> %d" % (i, d["number"]))
-          assert total == 9, "一轮应为 9 次，实际 %s" % total
-          assert last["roundDone"] is True, "第九次应标记本轮结束"
-          c = collections.Counter(items)
-          assert c[4] > 0, "这一轮没有命中 4: %s" % items
-          other = max(v for k, v in c.items() if k != 4)
-          assert c[4] > other, "4 不是唯一最高票: %s" % items
-          print("不变量校验通过：一轮 9 次 = %s，4 出现 %d 次，其他最多 %d 次" % (items, c[4], other))
+          dist = collections.Counter()
+          rounds = 12
+          total = 0
+
+          for r in range(rounds):
+              for i in range(1, 10):
+                  out = subprocess.run(["curl", "-fsS", "-c", jar, "-b", jar, base],
+                                       capture_output=True, text=True, check=True).stdout
+                  d = json.loads(out)
+                  assert d["index"] == i, "第 %d 轮第 %d 次 index 应为 %d，实际 %d" % (r + 1, i, i, d["index"])
+                  assert 1 <= d["number"] <= 8, "号码越界: %s" % d["number"]
+                  assert d["total"] == 9, "一轮应为 9 次，实际 %s" % d["total"]
+                  assert d["roundDone"] == (i == 9), "第 %d 次 roundDone 错误: %s" % (i, d["roundDone"])
+                  dist[d["number"]] += 1
+                  total += 1
+
+          print("共抽取 %d 次" % total)
+          for n in range(1, 9):
+              print("  号码 %d -> %d 次 (%.1f%%)" % (n, dist[n], 100.0 * dist[n] / total))
+
+          missing = [n for n in range(1, 9) if dist[n] == 0]
+          assert not missing, "这些号码从未出现（均匀随机下不该发生）: %s" % missing
+
+          # 12 轮 = 108 次抽取，单个号码占比的标准差约 0.032，
+          # 取 1/8 ± 0.13 是很宽松的区间：不会误报，但能抓出「某个号码被系统性抬高」。
+          want = 1.0 / 8.0
+          for n in range(1, 9):
+              share = dist[n] / float(total)
+              assert abs(share - want) <= 0.13, \
+                  "号码 %d 占比 %.3f 明显偏离均匀值 %.3f" % (n, share, want)
+
+          # 关键回归断言：如果又变回「每轮必中 4」，4 的占比会接近 37%。
+          share4 = dist[4] / float(total)
+          assert share4 < 0.25, "号码 4 占比 %.3f 偏高，像是重新启用了有偏模式" % share4
+          print("均匀性校验通过：4 的占比 %.3f，未出现有偏模式特征" % share4)
           ' "$jar"
 
           echo "--- 已删除的接口应返回 404 ---"
@@ -128,6 +148,33 @@ jobs:
             test "$code" = "404" || { echo "$p 期望 404，实际 $code"; exit 1; }
           done
           echo "旧接口均已下线"
+
+          echo "--- 有偏模式（备份算法）仍可用：SPECIAL_NUMBER=4 ---"
+          PORT=18082 SPECIAL_NUMBER=4 ./lucky-draw &
+          biased_pid=$!
+          trap 'kill $server_pid $biased_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18082/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+
+          jar2="$(mktemp)"
+          python3 -c '
+          import json, subprocess, sys, collections
+          jar = sys.argv[1]
+          base = "http://127.0.0.1:18082/api/draw"
+          for r in range(10):
+              items = []
+              for i in range(1, 10):
+                  out = subprocess.run(["curl", "-fsS", "-c", jar, "-b", jar, base],
+                                       capture_output=True, text=True, check=True).stdout
+                  items.append(json.loads(out)["number"])
+              c = collections.Counter(items)
+              assert c[4] > 0, "有偏模式第 %d 轮没有命中 4: %s" % (r + 1, items)
+              other = max(v for k, v in c.items() if k != 4)
+              assert c[4] > other, "有偏模式第 %d 轮 4 不是唯一最高票: %s" % (r + 1, items)
+          print("备份的有偏算法仍然可用：10 轮全部必中 4 且 4 为唯一最高票")
+          ' "$jar2"
 
       - name: 上传覆盖率报告
         uses: actions/upload-artifact@v4
