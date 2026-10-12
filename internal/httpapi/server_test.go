@@ -7,37 +7,94 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RazorEdge-wyh/lucky-draw/internal/config"
 )
 
-// newTestServer 返回一个用默认配置装配好的处理器。
-func newTestServer(t *testing.T) http.Handler {
+// newTestHandler 返回一个用默认配置装配好的处理器。
+func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 	cfg := config.Default()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("测试配置不合法: %v", err)
 	}
-	return New(cfg).Handler()
+	api, err := New(cfg)
+	if err != nil {
+		t.Fatalf("构造服务失败: %v", err)
+	}
+	return api.Handler()
 }
 
-// do 发起一次请求并返回状态码与响应体。
-func do(t *testing.T, h http.Handler, method, target string) (int, []byte) {
+// client 模拟一个浏览器：持有会话 Cookie，并串联后续请求。
+type client struct {
+	h      http.Handler
+	cookie string
+}
+
+func newClient(h http.Handler) *client { return &client{h: h} }
+
+// get 发起一次请求，自动带上已有的会话 Cookie，并记录响应下发的新 Cookie。
+func (c *client) get(t *testing.T, target string) (int, []byte) {
 	t.Helper()
-	req := httptest.NewRequest(method, target, nil)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	if c.cookie != "" {
+		req.Header.Set("Cookie", c.cookie)
+	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	c.h.ServeHTTP(rec, req)
+
 	body, err := io.ReadAll(rec.Result().Body)
 	if err != nil {
 		t.Fatalf("读取响应体失败: %v", err)
 	}
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == sessionCookie {
+			c.cookie = sessionCookie + "=" + ck.Value
+		}
+	}
 	return rec.Code, body
 }
 
-// TestHealthz 存活探针必须稳定返回 200 ok。
+// post 发起一次 POST 请求，同样维护 Cookie。
+func (c *client) post(t *testing.T, target string) (int, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, nil)
+	if c.cookie != "" {
+		req.Header.Set("Cookie", c.cookie)
+	}
+	rec := httptest.NewRecorder()
+	c.h.ServeHTTP(rec, req)
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("读取响应体失败: %v", err)
+	}
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == sessionCookie {
+			c.cookie = sessionCookie + "=" + ck.Value
+		}
+	}
+	return rec.Code, body
+}
+
+// drawOnce 抽一次并解析响应。
+func (c *client) drawOnce(t *testing.T) drawResponse {
+	t.Helper()
+	code, body := c.get(t, "/api/draw")
+	if code != http.StatusOK {
+		t.Fatalf("抽取失败: HTTP %d（%s）", code, body)
+	}
+	var resp drawResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v（原文 %s）", err, body)
+	}
+	return resp
+}
+
+// TestHealthz 存活探针。
 func TestHealthz(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/healthz")
+	h := newTestHandler(t)
+	code, body := newClient(h).get(t, "/healthz")
 	if code != http.StatusOK {
 		t.Fatalf("状态码应为 200，实际 %d", code)
 	}
@@ -46,24 +103,31 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-// TestIndexServesConsole 首页必须返回内置控制台 HTML。
-func TestIndexServesConsole(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/")
+// TestIndexIsMinimal 首页只应保留标题、号码位与按钮，
+// 用户明确要求删掉的功能不能再出现在页面上。
+func TestIndexIsMinimal(t *testing.T) {
+	h := newTestHandler(t)
+	code, body := newClient(h).get(t, "/")
 	if code != http.StatusOK {
 		t.Fatalf("状态码应为 200，实际 %d", code)
 	}
 	html := string(body)
-	for _, want := range []string{"<!DOCTYPE html>", "/app.js", "幸运抽奖"} {
+
+	for _, want := range []string{"<!DOCTYPE html>", "随机数生成器", `id="draw"`, `id="number"`, "/app.js"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("首页应包含 %q", want)
 		}
 	}
+	for _, unwanted := range []string{"连抽", "十连", "概率自检", "票数统计", "请求日志", "玩法", "特殊号码"} {
+		if strings.Contains(html, unwanted) {
+			t.Errorf("首页不应再包含已删除的功能：%q", unwanted)
+		}
+	}
 }
 
-// TestAppJSServed 前端脚本必须带正确的 MIME 并且非空。
+// TestAppJSServed 前端脚本必须带正确 MIME 且非空。
 func TestAppJSServed(t *testing.T) {
-	h := newTestServer(t)
+	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodGet, "/app.js", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -74,343 +138,172 @@ func TestAppJSServed(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
 		t.Errorf("Content-Type 应为 javascript，实际 %q", ct)
 	}
-	if rec.Body.Len() < 1000 {
+	if rec.Body.Len() < 500 {
 		t.Errorf("app.js 内容过短，可能没嵌入成功: %d 字节", rec.Body.Len())
 	}
 }
 
-// TestUnknownPathIs404 未注册路径必须 404，不能误返回首页。
-func TestUnknownPathIs404(t *testing.T) {
-	h := newTestServer(t)
-	if code, _ := do(t, h, http.MethodGet, "/nope"); code != http.StatusNotFound {
-		t.Errorf("未知路径应 404，实际 %d", code)
-	}
-	// 路径穿越尝试也必须被挡住。
-	if code, _ := do(t, h, http.MethodGet, "/web/../go.mod"); code == http.StatusOK {
-		t.Error("路径穿越不应返回 200")
-	}
-}
-
-// TestDrawReturnsValidPayload 抽奖接口的结构与不变量。
-func TestDrawReturnsValidPayload(t *testing.T) {
-	h := newTestServer(t)
-
-	for i := 0; i < 30; i++ {
-		code, body := do(t, h, http.MethodGet, "/api/draw")
-		if code != http.StatusOK {
-			t.Fatalf("状态码应为 200，实际 %d，响应 %s", code, body)
-		}
-
-		var resp drawResponse
-		if err := json.Unmarshal(body, &resp); err != nil {
-			t.Fatalf("响应不是合法 JSON: %v", err)
-		}
-
-		if len(resp.ID) != 32 {
-			t.Errorf("ID 应为 32 位十六进制，实际 %q", resp.ID)
-		}
-		if len(resp.Items) != 9 {
-			t.Fatalf("items 长度应为 9，实际 %d", len(resp.Items))
-		}
-		if resp.Stats.SpecialCount == 0 || resp.Stats.TopNumber != 4 {
-			t.Fatalf("特殊号码未被保证为唯一最高票: items=%v stats=%+v", resp.Items, resp.Stats)
-		}
-		if resp.Config.SpecialNumber != 4 || resp.Config.MaxNumber != 8 {
-			t.Errorf("响应中的配置不正确: %+v", resp.Config)
-		}
-		if resp.ElapsedMS < 0 {
-			t.Errorf("耗时不应为负: %v", resp.ElapsedMS)
-		}
-		if resp.Draws != nil {
-			t.Error("单轮请求不应返回 draws 数组")
-		}
-		// 号码必须落在号码池内。
-		for _, n := range resp.Items {
-			if n < 1 || n > 8 {
-				t.Fatalf("号码越界: %d", n)
-			}
+// TestRemovedEndpointsAreGone 已删除的接口与不存在的路径都必须 404。
+func TestRemovedEndpointsAreGone(t *testing.T) {
+	h := newTestHandler(t)
+	for _, p := range []string{"/nope", "/api/meta", "/api/simulate", "/web/../go.mod"} {
+		if code, _ := newClient(h).get(t, p); code == http.StatusOK {
+			t.Errorf("%s 不应返回 200", p)
 		}
 	}
 }
 
-// TestDrawBatch 批量抽奖返回 10 轮与汇总信息。
-func TestDrawBatch(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/api/draw?count=10")
-	if code != http.StatusOK {
-		t.Fatalf("状态码应为 200，实际 %d，响应 %s", code, body)
-	}
+// TestFirstDrawStartsNewRound 第一次抽取应当开始新一轮并下发会话 Cookie。
+func TestFirstDrawStartsNewRound(t *testing.T) {
+	h := newTestHandler(t)
+	c := newClient(h)
+	resp := c.drawOnce(t)
 
-	var resp drawResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
+	if resp.Index != 1 {
+		t.Errorf("新一轮第一次抽取的 index 应为 1，实际 %d", resp.Index)
 	}
-	if len(resp.Draws) != 10 {
-		t.Fatalf("应返回 10 轮结果，实际 %d", len(resp.Draws))
+	if resp.Total != 9 {
+		t.Errorf("一轮应为 9 次，实际 total=%d", resp.Total)
 	}
-	if resp.Summary == nil || resp.Summary.Rounds != 10 {
-		t.Fatalf("缺少批量汇总: %+v", resp.Summary)
+	if resp.Round != 1 {
+		t.Errorf("轮数应从 1 开始，实际 %d", resp.Round)
 	}
-	if resp.Summary.AverageAttempt < 1 {
-		t.Errorf("平均重抽轮数应 >= 1，实际 %v", resp.Summary.AverageAttempt)
+	if resp.RoundDone {
+		t.Error("第一次抽取不应标记本轮结束")
 	}
-	for i, d := range resp.Draws {
-		if len(d.Items) != 9 {
-			t.Errorf("第 %d 轮长度错误: %d", i, len(d.Items))
+	if resp.Number < 1 || resp.Number > 8 {
+		t.Errorf("号码应落在 1..8，实际 %d", resp.Number)
+	}
+	if c.cookie == "" {
+		t.Fatal("响应应当下发会话 Cookie")
+	}
+}
+
+// TestRoundIsNineDrawsAndFourAlwaysWins 核心不变量。
+//
+// 一轮九次、每次只返回一个号码；整轮结束后，4 必须出现过，
+// 且它的票数严格多于其他任何号码。这条断言直接对应需求：
+// 「九次为一轮，一轮一定命中 4」。
+func TestRoundIsNineDrawsAndFourAlwaysWins(t *testing.T) {
+	h := newTestHandler(t)
+
+	for roundNo := 1; roundNo <= 80; roundNo++ {
+		c := newClient(h) // 每轮换一个全新"浏览器"，确保是独立的一轮
+		items := make([]int, 0, 9)
+
+		for i := 1; i <= 9; i++ {
+			resp := c.drawOnce(t)
+
+			if resp.Index != i {
+				t.Fatalf("第 %d 轮第 %d 次的 index 应为 %d，实际 %d", roundNo, i, i, resp.Index)
+			}
+			if resp.Round != roundNo {
+				// 新会话的轮数恒为 1；只有同一会话继续才递增，这里每次都是新会话。
+				if resp.Round != 1 {
+					t.Fatalf("新会话的轮数应为 1，实际 %d", resp.Round)
+				}
+			}
+			if resp.RoundDone != (i == 9) {
+				t.Fatalf("第 %d 轮第 %d 次 roundDone 应为 %t，实际 %t",
+					roundNo, i, i == 9, resp.RoundDone)
+			}
+			if resp.Number < 1 || resp.Number > 8 {
+				t.Fatalf("号码越界: %d", resp.Number)
+			}
+			items = append(items, resp.Number)
 		}
-		if d.SpecialCount == 0 {
-			t.Errorf("第 %d 轮特殊号码未出现: %v", i, d.Items)
+
+		counts := map[int]int{}
+		for _, n := range items {
+			counts[n]++
+		}
+		if counts[4] == 0 {
+			t.Fatalf("第 %d 轮没有命中 4：%v", roundNo, items)
+		}
+		for n, cnt := range counts {
+			if n != 4 && cnt >= counts[4] {
+				t.Fatalf("第 %d 轮 4 不是唯一最高票：%v（4 出现 %d 次，%d 出现 %d 次）",
+					roundNo, items, counts[4], n, cnt)
+			}
 		}
 	}
 }
 
-// TestDrawParameterValidation 非法参数必须返回 400 并说明原因，而不是 500。
-func TestDrawParameterValidation(t *testing.T) {
-	h := newTestServer(t)
-	cases := []struct {
-		name   string
-		target string
-		want   string
-	}{
-		{"轮数超上限", "/api/draw?count=9999", "count"},
-		{"轮数为零", "/api/draw?count=0", "count"},
-		{"负轮数", "/api/draw?count=-5", "count"},
-		{"轮内次数超上限", "/api/draw?drawCount=100000", "drawCount"},
-		{"概率越界", "/api/draw?specialProb=2", "specialProb"},
-		{"概率非数字", "/api/draw?specialProb=abc", "specialProb"},
-		{"未知模式", "/api/draw?scenario=nope", "nope"},
-		{"号码池上界过小", "/api/draw?maxNumber=1", "maxNumber"},
+// TestConsecutiveRoundsInOneSession 同一个会话连续抽 18 次应当跨越两轮，
+// 第二轮的轮数递增，且两轮各自都满足「4 是唯一最高票」。
+func TestConsecutiveRoundsInOneSession(t *testing.T) {
+	h := newTestHandler(t)
+	c := newClient(h)
+
+	for roundNo := 1; roundNo <= 2; roundNo++ {
+		items := make([]int, 0, 9)
+		for i := 1; i <= 9; i++ {
+			resp := c.drawOnce(t)
+			if resp.Round != roundNo {
+				t.Fatalf("第 %d 轮第 %d 次返回的轮数应为 %d，实际 %d", roundNo, i, roundNo, resp.Round)
+			}
+			if resp.Index != i {
+				t.Fatalf("第 %d 轮第 %d 次的 index 应为 %d，实际 %d", roundNo, i, i, resp.Index)
+			}
+			items = append(items, resp.Number)
+		}
+		counts := map[int]int{}
+		for _, n := range items {
+			counts[n]++
+		}
+		if counts[4] == 0 {
+			t.Fatalf("第 %d 轮没有命中 4：%v", roundNo, items)
+		}
+		for n, cnt := range counts {
+			if n != 4 && cnt >= counts[4] {
+				t.Fatalf("第 %d 轮 4 不是唯一最高票：%v", roundNo, items)
+			}
+		}
+	}
+}
+
+// TestResetRestartsRound 重置后应当从第 1 次重新开始。
+func TestResetRestartsRound(t *testing.T) {
+	h := newTestHandler(t)
+	c := newClient(h)
+
+	// 先抽三次
+	for i := 0; i < 3; i++ {
+		c.drawOnce(t)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			code, body := do(t, h, http.MethodGet, tc.target)
-			if code != http.StatusBadRequest {
-				t.Fatalf("状态码应为 400，实际 %d，响应 %s", code, body)
-			}
-			var e errorResponse
-			if err := json.Unmarshal(body, &e); err != nil {
-				t.Fatalf("错误响应不是合法 JSON: %v", err)
-			}
-			if e.Status != http.StatusBadRequest {
-				t.Errorf("错误体里的 status 应为 400，实际 %d", e.Status)
-			}
-			if !strings.Contains(e.Error, tc.want) {
-				t.Errorf("错误信息应包含 %q，实际 %q", tc.want, e.Error)
-			}
-		})
+	if code, body := c.post(t, "/api/reset"); code != http.StatusOK {
+		t.Fatalf("重置应返回 200，实际 %d（%s）", code, body)
+	}
+
+	resp := c.drawOnce(t)
+	if resp.Index != 1 {
+		t.Errorf("重置后第一次抽取的 index 应为 1，实际 %d", resp.Index)
 	}
 }
 
 // TestDrawRejectsBadMethod 不支持的 HTTP 方法必须 405。
 func TestDrawRejectsBadMethod(t *testing.T) {
-	h := newTestServer(t)
-	if code, _ := do(t, h, http.MethodDelete, "/api/draw"); code != http.StatusMethodNotAllowed {
-		t.Errorf("DELETE 应返回 405，实际 %d", code)
+	h := newTestHandler(t)
+	c := newClient(h)
+	req := httptest.NewRequest(http.MethodDelete, "/api/draw", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("DELETE 应返回 405，实际 %d", rec.Code)
 	}
-	// POST 是被允许的。
-	if code, _ := do(t, h, http.MethodPost, "/api/draw"); code != http.StatusOK {
+	if code, _ := c.post(t, "/api/draw"); code != http.StatusOK {
 		t.Errorf("POST 应返回 200，实际 %d", code)
-	}
-}
-
-// TestMetaExposesWeightsAndModes 元信息接口要能支撑前端首屏渲染。
-func TestMetaExposesWeightsAndModes(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/api/meta")
-	if code != http.StatusOK {
-		t.Fatalf("状态码应为 200，实际 %d", code)
-	}
-
-	var meta metaResponse
-	if err := json.Unmarshal(body, &meta); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
-	}
-	if len(meta.Weights) != 8 {
-		t.Fatalf("权重表长度应为 8，实际 %d", len(meta.Weights))
-	}
-	sum := 0.0
-	specialWeight := -1.0
-	for _, w := range meta.Weights {
-		sum += w.Weight
-		if w.IsSpec {
-			specialWeight = w.Weight
-		}
-	}
-	if diff := sum - 1.0; diff > 1e-9 || diff < -1e-9 {
-		t.Errorf("权重之和应为 1，实际 %.12f", sum)
-	}
-	if specialWeight != 0.15 {
-		t.Errorf("特殊号码权重应为 0.15，实际 %v", specialWeight)
-	}
-	if len(meta.Modes) != 3 {
-		t.Errorf("应暴露 3 个模式，实际 %d", len(meta.Modes))
-	}
-	if meta.AcceptProb <= 0 || meta.AcceptProb >= 1 {
-		t.Errorf("单轮命中率应在 (0,1) 内，实际 %v", meta.AcceptProb)
-	}
-	// 默认参数下单轮命中率约 0.111，期望重抽约 9 轮。
-	if meta.AcceptProb < 0.08 || meta.AcceptProb > 0.15 {
-		t.Errorf("默认参数单轮命中率应约 0.11，实际 %v", meta.AcceptProb)
-	}
-	if !meta.Feasible {
-		t.Error("默认参数应当可行")
-	}
-	if meta.ExpectedRounds <= 1 {
-		t.Errorf("期望重抽轮数应大于 1，实际 %v", meta.ExpectedRounds)
-	}
-}
-
-// TestSimulateMatchesTheory 模拟接口的实测分布要贴近理论权重。
-func TestSimulateMatchesTheory(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/api/simulate?rounds=3000")
-	if code != http.StatusOK {
-		t.Fatalf("状态码应为 200，实际 %d，响应 %s", code, body)
-	}
-
-	var sim simulateResponse
-	if err := json.Unmarshal(body, &sim); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
-	}
-	if sim.Rounds != 3000 {
-		t.Errorf("模拟轮数应为 3000，实际 %d", sim.Rounds)
-	}
-	if len(sim.Distribution) != 8 {
-		t.Fatalf("分布条目应为 8，实际 %d", len(sim.Distribution))
-	}
-
-	// 约束模式下特殊号码 100% 是唯一最高票。
-	if sim.SpecialTopRate != 1 {
-		t.Errorf("特殊号码最高票率应为 1，实际 %v", sim.SpecialTopRate)
-	}
-	// 平均重抽轮数必须与解析期望一致（默认参数约 9 轮）。
-	if diff := sim.AverageAttempt - sim.ExpectedRounds; diff > 0.5 || diff < -0.5 {
-		t.Errorf("平均重抽 %.2f 与期望 %.2f 偏差过大", sim.AverageAttempt, sim.ExpectedRounds)
-	}
-	if sim.ExpectedRounds < 3 || sim.ExpectedRounds > 20 {
-		t.Errorf("默认参数的期望重抽轮数应落在 3..20，实际 %.2f", sim.ExpectedRounds)
-	}
-	// 特殊号码占比应高于任何一个其他号码（因为它必然至少 2 票）。
-	var specialShare, maxOtherShare float64
-	for _, d := range sim.Distribution {
-		if d.IsSpecial {
-			specialShare = d.Share
-		} else if d.Share > maxOtherShare {
-			maxOtherShare = d.Share
-		}
-	}
-	if specialShare <= maxOtherShare {
-		t.Errorf("特殊号码占比 %.4f 应高于其他号码最大值 %.4f", specialShare, maxOtherShare)
-	}
-	// 模拟不应污染线上统计口径之外的任何东西；这里只确认没有兜底告警路径。
-	if sim.SpecialSeenRate != 1 {
-		t.Errorf("约束模式下特殊号码出现率应为 1，实际 %v", sim.SpecialSeenRate)
-	}
-}
-
-// TestSimulateRoundsValidation 模拟轮数超限必须 400。
-func TestSimulateRoundsValidation(t *testing.T) {
-	h := newTestServer(t)
-	for _, target := range []string{"/api/simulate?rounds=0", "/api/simulate?rounds=999999"} {
-		if code, body := do(t, h, http.MethodGet, target); code != http.StatusBadRequest {
-			t.Errorf("%s 应返回 400，实际 %d（%s）", target, code, body)
-		}
-	}
-}
-
-// TestOutOfRangeMaxNumberRejected 号码池上界太小（池里凑不出可用的其他号码）时，
-// 必须在参数校验阶段就以 400 拒绝，而不是等到引擎里报 500。
-func TestOutOfRangeMaxNumberRejected(t *testing.T) {
-	h := newTestServer(t)
-	for _, target := range []string{"/api/draw?maxNumber=1", "/api/draw?maxNumber=0"} {
-		code, body := do(t, h, http.MethodGet, target)
-		if code != http.StatusBadRequest {
-			t.Fatalf("%s 应返回 400，实际 %d，响应 %s", target, code, body)
-		}
-		if !strings.Contains(string(body), "maxNumber") {
-			t.Errorf("错误信息应提到 maxNumber，实际 %s", body)
-		}
-	}
-}
-
-// TestSmallPoolStillWorks 号码池缩到 2 个号码仍然必须能正常抽奖：
-// 可行性的下限是「池里至少 2 个号码」，不是「其他号码足够多」。
-func TestSmallPoolStillWorks(t *testing.T) {
-	h := newTestServer(t)
-	for i := 0; i < 20; i++ {
-		code, body := do(t, h, http.MethodGet, "/api/draw?maxNumber=2")
-		if code != http.StatusOK {
-			t.Fatalf("号码池 1..2 应当可抽，实际 %d：%s", code, body)
-		}
-		var resp drawResponse
-		if err := json.Unmarshal(body, &resp); err != nil {
-			t.Fatalf("响应不是合法 JSON: %v", err)
-		}
-		if len(resp.Items) != 9 {
-			t.Fatalf("items 长度应为 9，实际 %d", len(resp.Items))
-		}
-		// 号码池只有 1、2，特殊号码被夹到 2，且它必须是唯一最高票。
-		for _, n := range resp.Items {
-			if n < 1 || n > 2 {
-				t.Fatalf("号码越界（池为 1..2）: %d", n)
-			}
-		}
-		if resp.Stats.TopNumber != 2 || resp.Stats.SpecialCount == 0 {
-			t.Fatalf("特殊号码（被夹到 2）应为唯一最高票: items=%v stats=%+v", resp.Items, resp.Stats)
-		}
-	}
-}
-
-// TestFairScenarioIsUnconstrained 等概率模式必须跳过整轮约束。
-func TestFairScenarioIsUnconstrained(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/api/draw?scenario=fair")
-	if code != http.StatusOK {
-		t.Fatalf("状态码应为 200，实际 %d，响应 %s", code, body)
-	}
-
-	var resp drawResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
-	}
-	if resp.Config.Constrained {
-		t.Error("等概率模式不应启用约束")
-	}
-	if resp.Attempts != 1 {
-		t.Errorf("等概率模式不应重抽，实际 %d 轮", resp.Attempts)
-	}
-	// 权重应均等：8 个号码 → 每个 0.125。
-	if diff := resp.Config.SpecialProb - 0.125; diff > 1e-12 || diff < -1e-12 {
-		t.Errorf("等概率模式权重应为 0.125，实际 %v", resp.Config.SpecialProb)
-	}
-}
-
-// TestSpecialProbOverride 单次请求覆盖权重必须真正生效。
-func TestSpecialProbOverride(t *testing.T) {
-	h := newTestServer(t)
-	code, body := do(t, h, http.MethodGet, "/api/draw?specialProb=0.5")
-	if code != http.StatusOK {
-		t.Fatalf("状态码应为 200，实际 %d，响应 %s", code, body)
-	}
-	var resp drawResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
-	}
-	if resp.Config.SpecialProb != 0.5 {
-		t.Errorf("权重覆盖未生效，实际 %v", resp.Config.SpecialProb)
 	}
 }
 
 // TestSecurityHeaders 基础安全响应头必须存在。
 func TestSecurityHeaders(t *testing.T) {
-	h := newTestServer(t)
+	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/draw", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-
 	for k, want := range map[string]string{
-		"Cache-Control":          "no-store",
 		"X-Content-Type-Options": "nosniff",
 		"X-Frame-Options":        "DENY",
 	} {
@@ -420,44 +313,44 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
-// TestEngineCacheReuse 相同参数的重复请求应复用同一个引擎实例。
-func TestEngineCacheReuse(t *testing.T) {
-	cfg := config.Default()
-	srv := New(cfg)
+// TestSessionStoreGC 过期会话必须被回收，避免内存无限增长。
+func TestSessionStoreGC(t *testing.T) {
+	s := newStore()
+	old := &session{seq: []int{1}}
+	old.lastSeen = time.Now().Add(-3 * sessionTTL)
+	s.sessions["old"] = old
+	s.put("fresh", &session{seq: []int{1}})
 
-	req := request{Scenario: "challenging", Count: 1}
-	e1, _, _, err := srv.engineFor(req)
-	if err != nil {
-		t.Fatalf("第一次构造失败: %v", err)
+	if n := s.gc(time.Now()); n != 1 {
+		t.Errorf("应回收 1 个过期会话，实际 %d", n)
 	}
-	e2, _, _, err := srv.engineFor(req)
-	if err != nil {
-		t.Fatalf("第二次构造失败: %v", err)
+	if s.size() != 1 {
+		t.Errorf("回收后应剩 1 个会话，实际 %d", s.size())
 	}
-	if e1 != e2 {
-		t.Error("相同参数应命中缓存并复用同一引擎")
+	if _, ok := s.get("old"); ok {
+		t.Error("过期会话不应还能取到")
 	}
-
-	// 不同参数必须产生不同引擎。
-	e3, _, _, err := srv.engineFor(request{Scenario: "hot", Count: 1})
-	if err != nil {
-		t.Fatalf("加权模式构造失败: %v", err)
-	}
-	if e3 == e1 {
-		t.Error("不同参数不应复用同一引擎")
+	if _, ok := s.get("fresh"); !ok {
+		t.Error("未过期会话应当保留")
 	}
 }
 
-// TestClientIP 客户端地址解析要优先信任反代写入的原地址。
-func TestClientIP(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "10.0.0.9:12345"
-	if got := clientIP(req); got != "10.0.0.9" {
-		t.Errorf("应解析出 10.0.0.9，实际 %q", got)
+// TestSessionStoreEviction 会话数超限时必须能自愈。
+func TestSessionStoreEviction(t *testing.T) {
+	s := newStore()
+	for i := 0; i < sessionMax+10; i++ {
+		s.put(randomKey(i), &session{seq: []int{1}})
 	}
+	s.evictIfNeeded()
+	if s.size() > sessionMax {
+		t.Errorf("清理后会话数应不超过 %d，实际 %d", sessionMax, s.size())
+	}
+}
 
-	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
-	if got := clientIP(req); got != "203.0.113.7" {
-		t.Errorf("应取 XFF 中第一个地址，实际 %q", got)
-	}
+// randomKey 生成互不相同的测试键。
+func randomKey(i int) string {
+	const digits = "0123456789abcdef"
+	return string([]byte{
+		digits[(i>>12)&0xf], digits[(i>>8)&0xf], digits[(i>>4)&0xf], digits[i&0xf],
+	})
 }

@@ -1,63 +1,155 @@
-// Package httpapi 提供抽奖服务的 HTTP 接口。
+// Package httpapi 提供极简的抽奖接口：一次请求返回一个号码。
 //
-// 接口一览：
+//	GET  /api/draw   抽下一个号码（首次请求自动开始新一轮）
+//	GET  /api/reset  放弃当前进度，重新开始一轮
+//	GET  /healthz    存活探针
+//	GET  /           内置页面
 //
-//	GET  /healthz       存活探针
-//	GET  /api/meta      当前配置、模式列表与权重表（前端首屏自检用）
-//	GET  /api/draw      抽奖（默认 1 轮，?count=N 可批量）
-//	GET  /api/simulate  蒙特卡洛自检：跑 N 轮并返回实测分布
-//	GET  /              内置网页控制台
+// 「一轮九次、特殊号码必定是唯一最高票」这个约束由 engine 保证：
+// 每条结果序列都是一次性生成好的，接口只是把它按顺序一个一个交付出去。
+// 因此不存在「抽到第八次发现凑不齐、只能重来」的情况 —— 整轮早在第一次
+// 请求时就已经确定并满足约束了。
 package httpapi
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"runtime/debug"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/RazorEdge-wyh/lucky-draw/internal/config"
 	"github.com/RazorEdge-wyh/lucky-draw/internal/engine"
 	"github.com/RazorEdge-wyh/lucky-draw/internal/randsource"
-	"github.com/RazorEdge-wyh/lucky-draw/internal/scenario"
 )
 
-// 单次请求允许的最大抽奖轮数，防止 ?count=1000000 之类的请求打满 CPU。
-const maxBatchCount = 100
+const (
+	// sessionCookie 保存浏览器会话标识，用于记住「本轮抽到第几个了」。
+	sessionCookie = "ld_sid"
 
-// maxSimulateRounds 是自检接口允许的最大模拟轮数。
-const maxSimulateRounds = 20000
+	// sessionMax 限制同时存在的会话数，防止无人清理的旧会话把内存吃满。
+	sessionMax = 10000
 
-// maxCachedEngines 限制参数变体缓存条数，避免被构造出来的任意参数撑爆内存。
-const maxCachedEngines = 64
+	// sessionTTL 是会话空闲多久后可以被回收。
+	// 一轮只有九次，正常用户几秒就抽完；两小时纯粹是留给「过一会儿再来抽」的场景。
+	sessionTTL = 2 * time.Hour
 
-// maxDrawCount 是一次请求内「一轮抽多少次」的上限。
-const maxDrawCount = 1000
+	// cleanupEvery 是后台清理的间隔。
+	cleanupEvery = 10 * time.Minute
+)
 
-// maxNumberLimit 是号码池上界的上限，防止构造出极端巨大的累积概率表。
-const maxNumberLimit = 1000
+// session 是某个浏览器当前那一轮的进度。
+type session struct {
+	// seq 是本轮已经生成好的完整号码序列，长度等于 DrawCount。
+	seq []int
+	// pos 是下一个要交付的下标。
+	pos int
+	// rounds 是该会话累计完成的轮数。
+	rounds int
+	// lastSeen 用于空闲回收。
+	lastSeen time.Time
+}
+
+// store 是内存会话表。单实例部署足够；多副本时各副本各管各的会话。
+type store struct {
+	mu       sync.Mutex
+	sessions map[string]*session
+}
+
+func newStore() *store {
+	return &store{sessions: make(map[string]*session)}
+}
+
+// get 取出会话并刷新其活跃时间。
+func (s *store) get(id string) (*session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return nil, false
+	}
+	sess.lastSeen = time.Now()
+	return sess, true
+}
+
+// put 写入（或覆盖）一个会话。
+func (s *store) put(id string, sess *session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess.lastSeen = time.Now()
+	s.sessions[id] = sess
+}
+
+// drop 删除一个会话。
+func (s *store) drop(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, id)
+}
+
+// gc 回收空闲过久的会话，返回回收数量。
+func (s *store) gc(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dropped := 0
+	for id, sess := range s.sessions {
+		if now.Sub(sess.lastSeen) > sessionTTL {
+			delete(s.sessions, id)
+			dropped++
+		}
+	}
+	return dropped
+}
+
+func (s *store) size() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions)
+}
+
+// evictIfNeeded 在会话数超限时先清过期项；若仍然超限就整表清空。
+// 宁可让个别用户重新开始一轮，也不能让内存无限增长。
+func (s *store) evictIfNeeded() {
+	if s.size() <= sessionMax {
+		return
+	}
+	s.gc(time.Now())
+	if s.size() > sessionMax {
+		s.mu.Lock()
+		n := len(s.sessions)
+		s.sessions = make(map[string]*session)
+		s.mu.Unlock()
+		log.Printf("warn: 会话数超过 %d，已清空全部会话（清理了 %d 条）", sessionMax, n)
+	}
+}
 
 // Server 组装 HTTP 处理器。
 type Server struct {
-	base  config.Config
-	stats *metrics
-
-	mu      sync.Mutex
-	engines map[string]*engine.Engine
-	order   []string
+	engine *engine.Engine
+	cfg    config.Config
+	store  *store
 }
 
-// New 构造 HTTP 服务。base 来自环境变量，是所有模式的基础配置。
-func New(base config.Config) *Server {
-	return &Server{
-		base:    base,
-		stats:   &metrics{startedAt: time.Now()},
-		engines: make(map[string]*engine.Engine),
+// New 构造 HTTP 服务。base 来自环境变量。
+func New(base config.Config) (*Server, error) {
+	eng, err := engine.New(base)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{engine: eng, cfg: base, store: newStore()}
+	go s.cleanupLoop()
+	return s, nil
+}
+
+// cleanupLoop 定期回收空闲会话。
+func (s *Server) cleanupLoop() {
+	ticker := time.NewTicker(cleanupEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		if n := s.store.gc(time.Now()); n > 0 {
+			log.Printf("cleanup: 回收了 %d 个空闲会话，剩余 %d 个", n, s.store.size())
+		}
 	}
 }
 
@@ -65,9 +157,8 @@ func New(base config.Config) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/api/meta", s.handleMeta)
 	mux.HandleFunc("/api/draw", s.handleDraw)
-	mux.HandleFunc("/api/simulate", s.handleSimulate)
+	mux.HandleFunc("/api/reset", s.handleReset)
 	mux.HandleFunc("/app.js", s.handleAsset)
 	mux.HandleFunc("/", s.handleIndex)
 
@@ -75,131 +166,26 @@ func (s *Server) Handler() http.Handler {
 }
 
 // ---------------------------------------------------------------------------
-// 参数解析
+// 响应结构
 // ---------------------------------------------------------------------------
 
-// request 是一次抽奖请求解析后的参数。
-//
-// DrawCount / MaxNumber 用指针而不是「0 表示未指定」：
-// 0 本身对客户端来说是一个可能被传进来的（非法）取值，
-// 如果拿 0 当哨兵，?maxNumber=0 就会被静默当成「用默认值」而返回 200。
-type request struct {
-	Scenario scenario.Name
-	// DrawCount 覆盖一轮抽多少次；nil 表示使用服务端配置。
-	DrawCount *int
-	// MaxNumber 覆盖号码池上界；nil 表示使用服务端配置。
-	MaxNumber *int
-	// SpecialProb 覆盖特殊号码权重；nil 表示使用模式默认值。
-	SpecialProb *float64
-	// Count 一次请求抽几轮。
-	Count int
+// drawResponse 是一次抽取的响应。
+type drawResponse struct {
+	// Number 是本次抽出的号码。
+	Number int `json:"number"`
+	// Index 是本次是这一轮的第几次，取值 1..Total。
+	Index int `json:"index"`
+	// Total 是一轮的次数。
+	Total int `json:"total"`
+	// RoundDone 表示这一轮是否已经抽满。
+	RoundDone bool `json:"roundDone"`
+	// Round 是本会话当前的轮数（从 1 开始）。
+	Round int `json:"round"`
 }
 
-// parseRequest 从查询串解析参数，并做范围校验。
-//
-// 设计要点：用指针区分「参数没传」（走服务端默认值）和「传了但非法」（直接 400）。
-// 如果两者混为一谈，?count=0 会被静默当成默认值，调用方拿到 200 却不知道自己传错了。
-func (s *Server) parseRequest(r *http.Request) (request, error) {
-	q := r.URL.Query()
-
-	sc, err := scenario.Lookup(q.Get("scenario"))
-	if err != nil {
-		return request{}, err
-	}
-
-	req := request{Scenario: sc.Name, Count: 1}
-
-	count, err := intParamStrict(q, "count")
-	if err != nil {
-		return request{}, err
-	}
-	if count != nil {
-		req.Count = *count
-	}
-	if req.DrawCount, err = intParamStrict(q, "drawCount"); err != nil {
-		return request{}, err
-	}
-	if req.MaxNumber, err = intParamStrict(q, "maxNumber"); err != nil {
-		return request{}, err
-	}
-
-	if req.Count < 1 || req.Count > maxBatchCount {
-		return request{}, fmt.Errorf("count 必须在 1..%d 之间，收到 %d", maxBatchCount, req.Count)
-	}
-	if req.DrawCount != nil && (*req.DrawCount < 1 || *req.DrawCount > maxDrawCount) {
-		return request{}, fmt.Errorf("drawCount 必须在 1..%d 之间，收到 %d", maxDrawCount, *req.DrawCount)
-	}
-	if req.MaxNumber != nil && (*req.MaxNumber < s.base.MinNumber+1 || *req.MaxNumber > maxNumberLimit) {
-		return request{}, fmt.Errorf("maxNumber 必须在 %d..%d 之间，收到 %d",
-			s.base.MinNumber+1, maxNumberLimit, *req.MaxNumber)
-	}
-	if v := q.Get("specialProb"); v != "" {
-		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-		if err != nil {
-			return request{}, fmt.Errorf("specialProb 不是合法数字：%q", v)
-		}
-		if f < 0 || f > 1 {
-			return request{}, fmt.Errorf("specialProb 必须在 0..1 之间，收到 %v", f)
-		}
-		req.SpecialProb = &f
-	}
-
-	return req, nil
-}
-
-// engineFor 返回（并缓存）某个参数组合对应的引擎。
-//
-// 之所以缓存：每次调用 engine.New 都要重建累积分布表，批量抽奖时重复构建纯属浪费。
-// 缓存以「影响引擎行为的全部参数」为键，因此命中缓存等价于命中同一套概率。
-func (s *Server) engineFor(req request) (*engine.Engine, config.Config, scenario.Info, error) {
-	base := s.base
-
-	sc, err := scenario.Lookup(string(req.Scenario))
-	if err != nil {
-		return nil, base, scenario.Info{}, err
-	}
-
-	cfg := sc.Apply(base)
-	if req.DrawCount != nil {
-		cfg.DrawCount = *req.DrawCount
-	}
-	if req.MaxNumber != nil {
-		cfg.MaxNumber = *req.MaxNumber
-		// 缩小号码池后，特殊号码可能落在池外，必须重新夹取。
-		if cfg.SpecialNumber > cfg.MaxNumber {
-			cfg.SpecialNumber = cfg.MaxNumber
-		}
-	}
-	if req.SpecialProb != nil {
-		cfg.SpecialProb = *req.SpecialProb
-	}
-	if err := cfg.Validate(); err != nil {
-		return nil, cfg, sc, err
-	}
-
-	key := cacheKey(cfg)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.engines[key]; ok {
-		return e, cfg, sc, nil
-	}
-	e, err := engine.New(cfg)
-	if err != nil {
-		return nil, cfg, sc, err
-	}
-	if len(s.order) >= maxCachedEngines {
-		delete(s.engines, s.order[0])
-		s.order = s.order[1:]
-	}
-	s.engines[key] = e
-	s.order = append(s.order, key)
-	return e, cfg, sc, nil
-}
-
-func cacheKey(cfg config.Config) string {
-	return fmt.Sprintf("%d|%d|%d|%.10f|%.10f|%d|%t",
-		cfg.DrawCount, cfg.MinNumber, cfg.MaxNumber, cfg.SpecialProb,
-		float64(cfg.SpecialNumber), cfg.MaxAttempts, cfg.Constrained)
+type errorResponse struct {
+	Error  string `json:"error"`
+	Status int    `json:"status"`
 }
 
 // ---------------------------------------------------------------------------
@@ -212,180 +198,95 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// handleDraw 交付本轮的下一个号码。
 func (s *Server) handleDraw(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "只支持 GET / POST")
 		return
 	}
 
-	req, err := s.parseRequest(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	id, sess := s.sessionFor(r)
+	// 两种情况需要现开一轮：
+	//   - sess == nil：新访客，或旧会话已过期；
+	//   - pos >= len(seq)：上一轮已经抽满九次，这一次点击属于下一轮。
+	//
+	// 第二种情况要是漏了，就会在轮次边界上越界 panic —— 这是真实踩过的坑。
+	if sess == nil {
+		id = randsource.NewID()
+		sess = &session{}
+		s.setCookie(w, id)
 	}
-	e, cfg, sc, err := s.engineFor(req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	start := time.Now()
-	results := make([]drawJSON, 0, req.Count)
-	attemptTotal := 0
-	fallbackCount := 0
-
-	for i := 0; i < req.Count; i++ {
-		res, err := e.DrawChecked()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		attemptTotal += res.Attempts
-		if res.Fallback {
-			fallbackCount++
-			// 兜底意味着参数过紧，正常线上不该出现，必须留下告警日志。
-			log.Printf("warn: 抽奖触发兜底构造 scenario=%s cfg=%s", req.Scenario, cacheKey(cfg))
-		}
-		results = append(results, s.toDrawJSON(e, res))
+	if sess.pos >= len(sess.seq) {
+		sess.seq = s.engine.DrawSequence()
+		sess.pos = 0
 	}
 
-	elapsed := time.Since(start)
-	id := randsource.NewID()
-	s.stats.record(req.Count, elapsed)
+	n := sess.seq[sess.pos]
+	sess.pos++
+	roundDone := sess.pos >= len(sess.seq)
 
-	// 服务端日志：只记录最终结果与耗时，方便排查线上问题。
-	log.Printf("draw id=%s scenario=%s count=%d attempts=%d cost=%s",
-		id, req.Scenario, req.Count, attemptTotal, elapsed)
-
-	resp := drawResponse{
-		ID:        id,
-		Timestamp: time.Now().UnixMilli(),
-		ElapsedMS: float64(elapsed.Microseconds()) / 1000.0,
-		Scenario:  scenarioInfoJSON(sc),
-		Config:    toConfigJSON(cfg),
-		Items:     results[0].Items,
-		Stats:     results[0].Stats,
-		Attempts:  results[0].Attempts,
-		Fallback:  results[0].Fallback,
-		Draws:     results,
-	}
-	if req.Count == 1 {
-		resp.Draws = nil // 单轮请求不重复返回整个数组
-	} else {
-		resp.Summary = &summaryJSON{
-			Rounds:         req.Count,
-			AverageAttempt: float64(attemptTotal) / float64(req.Count),
-			FallbackRounds: fallbackCount,
-		}
+	// 轮数：整轮结束后才 +1，因此进行中的这一轮就是 rounds+1。
+	roundNumber := sess.rounds + 1
+	if roundDone {
+		sess.rounds++
 	}
 
-	writeJSON(w, http.StatusOK, resp)
-}
+	s.store.put(id, sess)
+	s.store.evictIfNeeded()
 
-func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
-	e, cfg, _, err := s.engineFor(request{Scenario: scenario.Default(), Count: 1})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	log.Printf("draw sid=%s number=%d index=%d/%d round=%d done=%t",
+		shortID(id), n, sess.pos, len(sess.seq), roundNumber, roundDone)
 
-	weights := make([]weightJSON, 0, len(e.Weights()))
-	for i, n := range numberRange(cfg) {
-		w := e.Weights()[i]
-		weights = append(weights, weightJSON{
-			Number: n,
-			Weight: w,
-			IsSpec: n == cfg.SpecialNumber,
-		})
-	}
-
-	modes := make([]scenarioJSON, 0, len(scenario.All()))
-	for _, m := range scenario.All() {
-		modes = append(modes, scenarioInfoJSON(m))
-	}
-
-	writeJSON(w, http.StatusOK, metaResponse{
-		Config:         toConfigJSON(cfg),
-		Modes:          modes,
-		Weights:        weights,
-		AcceptProb:     e.AcceptProb(),
-		ExpectedRounds: expectedRounds(e.AcceptProb()),
-		Feasible:       e.Feasible(),
-		Uptime:         int64(time.Since(s.stats.startedAt).Seconds()),
-		ServerTime:     time.Now().UnixMilli(),
+	writeJSON(w, http.StatusOK, drawResponse{
+		Number:    n,
+		Index:     sess.pos,
+		Total:     len(sess.seq),
+		RoundDone: roundDone,
+		Round:     roundNumber,
 	})
 }
 
-func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
-	req, err := s.parseRequest(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+// handleReset 放弃当前进度，下一次抽取会开新一轮。
+func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "只支持 GET / POST")
 		return
 	}
-	rounds := intParam(r.URL.Query(), "rounds", 2000)
-	if rounds < 1 || rounds > maxSimulateRounds {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("rounds 必须在 1..%d 之间，收到 %d", maxSimulateRounds, rounds))
-		return
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		s.store.drop(c.Value)
 	}
-	e, cfg, _, err := s.engineFor(req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	s.setCookie(w, randsource.NewID())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// sessionFor 读取当前会话；没有或已过期时返回 nil。
+func (s *Server) sessionFor(r *http.Request) (string, *session) {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || c.Value == "" {
+		return "", nil
 	}
-
-	start := time.Now()
-	dist := make(map[int]int, cfg.PoolSize())  // 号码 -> 出现总次数
-	specialTop := 0                            // 特殊号码成为唯一最多的轮数
-	specialSeen := 0                           // 特殊号码至少出现一次的轮数
-	attemptSum := 0                            // 累计内部重抽轮数
-	spread := make(map[int]int, cfg.DrawCount) // 特殊号码出现 k 次 -> 轮数
-
-	for i := 0; i < rounds; i++ {
-		res, err := e.DrawChecked()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		attemptSum += res.Attempts
-		st := e.Stats(res.Items)
-		for _, n := range res.Items {
-			dist[n]++
-		}
-		spread[st.SpecialCount]++
-		if st.SpecialCount > 0 {
-			specialSeen++
-		}
-		if st.TopNumber == cfg.SpecialNumber {
-			specialTop++
-		}
+	sess, ok := s.store.get(c.Value)
+	if !ok {
+		// 会话已过期：清掉这个 Cookie，让调用方重新开始。
+		return "", nil
 	}
+	return c.Value, sess
+}
 
-	distOut := make([]simDistJSON, 0, len(dist))
-	for _, n := range numberRange(cfg) {
-		c := dist[n]
-		distOut = append(distOut, simDistJSON{
-			Number:    n,
-			Count:     c,
-			Share:     float64(c) / float64(rounds*cfg.DrawCount),
-			IsSpecial: n == cfg.SpecialNumber,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, simulateResponse{
-		Rounds:             rounds,
-		DrawCount:          cfg.DrawCount,
-		Config:             toConfigJSON(cfg),
-		AcceptProbTheory:   e.AcceptProb(),
-		ExpectedRounds:     expectedRounds(e.AcceptProb()),
-		AverageAttempt:     float64(attemptSum) / float64(rounds),
-		SpecialTopRate:     float64(specialTop) / float64(rounds),
-		SpecialSeenRate:    float64(specialSeen) / float64(rounds),
-		SpecialCountSpread: spread,
-		Distribution:       distOut,
-		ElapsedMS:          float64(time.Since(start).Microseconds()) / 1000.0,
+func (s *Server) setCookie(w http.ResponseWriter, id string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    id,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 	})
 }
+
+// ---------------------------------------------------------------------------
+// 静态资源
+// ---------------------------------------------------------------------------
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -401,11 +302,24 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/app.js" {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := asset("web/app.js")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
 // ---------------------------------------------------------------------------
-// 中间件
+// 中间件与工具
 // ---------------------------------------------------------------------------
 
-// recoverer 保证单个请求的 panic 不会拖垮整个进程。
 func (s *Server) recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -418,23 +332,22 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// logger 记录访问日志，并附上真实客户端地址。
 func (s *Server) logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		// 健康检查太频繁，不记日志以免淹没有效信息。
-		if r.URL.Path != "/healthz" {
-			log.Printf("http %s %s from=%s cost=%s", r.Method, r.URL.Path,
-				clientIP(r), time.Since(start))
+		// 健康检查与静态资源太频繁，不记日志以免淹没有效信息。
+		switch r.URL.Path {
+		case "/healthz", "/app.js":
+			return
 		}
+		log.Printf("http %s %s cost=%s", r.Method, r.URL.Path, time.Since(start))
 	})
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Cache-Control", "no-store")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
@@ -442,111 +355,22 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// 反代链路上第一个地址才是原始客户端。
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// ---------------------------------------------------------------------------
-// 统计与工具
-// ---------------------------------------------------------------------------
-
-type metrics struct {
-	mu        sync.Mutex
-	startedAt time.Time
-	total     int64
-	elapsedUS int64
-	slowest   time.Duration
-}
-
-func (m *metrics) record(n int, d time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.total += int64(n)
-	m.elapsedUS += d.Microseconds()
-	if d > m.slowest {
-		m.slowest = d
-	}
-}
-
-// expectedRounds 把「单轮命中率」换算成期望重抽轮数 1/p。
-func expectedRounds(p float64) float64 {
-	if p <= 0 {
-		return 0
-	}
-	return 1 / p
-}
-
-// numberRange 返回号码池的完整升序序列。
-func numberRange(cfg config.Config) []int {
-	out := make([]int, 0, cfg.PoolSize())
-	for n := cfg.MinNumber; n <= cfg.MaxNumber; n++ {
-		out = append(out, n)
-	}
-	return out
-}
-
-// intParam 读取整型查询参数，缺失或非法时返回默认值。
-// 仅用于服务端内部默认值处理（如 rounds），不用于需要报错的入参校验。
-func intParam(q map[string][]string, key string, def int) int {
-	v, err := intParamStrict(q, key)
-	if err != nil || v == nil {
-		return def
-	}
-	return *v
-}
-
-// intParamStrict 读取整型查询参数。
-// 返回值语义：nil 表示参数未出现（或为空串）；非 nil 表示调用方确实传了值。
-func intParamStrict(q map[string][]string, key string) (*int, error) {
-	vs, ok := q[key]
-	if !ok || len(vs) == 0 || strings.TrimSpace(vs[0]) == "" {
-		return nil, nil
-	}
-	raw := strings.TrimSpace(vs[0])
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%s 不是合法整数：%q", key, raw)
-	}
-	return &n, nil
-}
-
-func (s *Server) toDrawJSON(e *engine.Engine, res *engine.Result) drawJSON {
-	st := e.Stats(res.Items)
-	counts := make([]countJSON, 0, len(st.Counts))
-	for _, n := range e.Config().Others() {
-		counts = append(counts, countJSON{Number: n, Count: st.Counts[n]})
-	}
-	return drawJSON{
-		Items:        res.Items,
-		Stats:        st,
-		Attempts:     res.Attempts,
-		Fallback:     res.Fallback,
-		SpecialCount: st.SpecialCount,
-		OtherCounts:  counts,
-	}
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
+	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("error: 响应编码失败: %v", err)
 	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg, Status: status})
+}
+
+// shortID 只取会话 ID 的前 8 位打日志，避免日志里出现完整标识。
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }

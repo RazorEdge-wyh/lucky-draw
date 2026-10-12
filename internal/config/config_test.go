@@ -62,7 +62,6 @@ func TestEnvOverrides(t *testing.T) {
 	t.Setenv("MIN_NUMBER", "2")
 	t.Setenv("MAX_NUMBER", "20")
 	t.Setenv("MAX_ATTEMPTS", "77")
-	t.Setenv("CONSTRAINED", "false")
 	t.Setenv("PORT", "9999")
 
 	cfg := Load()
@@ -75,9 +74,6 @@ func TestEnvOverrides(t *testing.T) {
 	if cfg.MaxAttempts != 77 {
 		t.Errorf("MAX_ATTEMPTS 未生效: %d", cfg.MaxAttempts)
 	}
-	if cfg.Constrained {
-		t.Error("CONSTRAINED=false 未生效")
-	}
 	if cfg.Port != "9999" {
 		t.Errorf("PORT 未生效: %s", cfg.Port)
 	}
@@ -89,7 +85,6 @@ func TestEnvInvalidFallsBackToDefault(t *testing.T) {
 	t.Setenv("DRAW_COUNT", "not-a-number")
 	t.Setenv("SPECIAL_PROB", "abc")
 	t.Setenv("MAX_NUMBER", "")
-	t.Setenv("CONSTRAINED", "maybe")
 
 	cfg := Load()
 	def := Default()
@@ -101,28 +96,6 @@ func TestEnvInvalidFallsBackToDefault(t *testing.T) {
 	}
 	if cfg.MaxNumber != def.MaxNumber {
 		t.Errorf("空 MAX_NUMBER 应退回默认值 %d，实际 %d", def.MaxNumber, cfg.MaxNumber)
-	}
-	if cfg.Constrained != def.Constrained {
-		t.Errorf("非法 CONSTRAINED 应退回默认值 %v，实际 %v", def.Constrained, cfg.Constrained)
-	}
-}
-
-// TestEnvBoolVariants 布尔解析要容忍常见的书写方式。
-func TestEnvBoolVariants(t *testing.T) {
-	trues := []string{"1", "true", "TRUE", "yes", "on", "Y"}
-	falses := []string{"0", "false", "no", "off", "n"}
-
-	for _, v := range trues {
-		t.Setenv("CONSTRAINED", v)
-		if !Load().Constrained {
-			t.Errorf("%q 应解析为 true", v)
-		}
-	}
-	for _, v := range falses {
-		t.Setenv("CONSTRAINED", v)
-		if Load().Constrained {
-			t.Errorf("%q 应解析为 false", v)
-		}
 	}
 }
 

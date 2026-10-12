@@ -201,35 +201,34 @@ func TestFeasibilityAcrossPoolSizes(t *testing.T) {
 	}
 }
 
-// TestUnconstrainedModeHasNoConstraint 等概率/加权模式不应做整轮筛选。
-func TestUnconstrainedModeHasNoConstraint(t *testing.T) {
-	cfg := defaultCfg()
-	cfg.Constrained = false
-	cfg.SpecialProb = 1.0 / 8
+// TestDrawSequenceIsNineLongAndFourWins 校验提供给「一次只交付一个号码」接口的
+// DrawSequence：长度等于一轮次数，且满足核心约束。
+func TestDrawSequenceIsNineLongAndFourWins(t *testing.T) {
+	e := newTestEngine(t, defaultCfg(), 2024)
 
-	e := newTestEngine(t, cfg, 2024)
-	if e.AcceptProb() != 1 {
-		t.Errorf("无约束模式的单轮命中率应为 1，实际 %v", e.AcceptProb())
-	}
-	if !e.Feasible() {
-		t.Error("无约束模式永远可行")
-	}
-
-	// 允许出现「特殊号码不是最高票」的情况，说明约束确实关闭了。
-	sawUnconstrained := false
 	for i := 0; i < 300; i++ {
-		res := e.Draw()
-		if res.Attempts != 1 {
-			t.Fatalf("无约束模式不该重抽，实际 %d 轮", res.Attempts)
+		seq := e.DrawSequence()
+		if len(seq) != 9 {
+			t.Fatalf("第 %d 轮序列长度应为 9，实际 %d：%v", i, len(seq), seq)
 		}
-		st := e.Stats(res.Items)
-		if st.TopNumber != cfg.SpecialNumber {
-			sawUnconstrained = true
-			break
+		st := e.Stats(seq)
+		if st.SpecialCount == 0 {
+			t.Fatalf("第 %d 轮没有命中 4：%v", i, seq)
 		}
-	}
-	if !sawUnconstrained {
-		t.Error("300 轮里特殊号码次次都是最高票，约束似乎没有关闭")
+		if st.TopNumber != 4 {
+			t.Fatalf("第 %d 轮 4 不是唯一最高票：%v", i, seq)
+		}
+		for n, c := range st.Counts {
+			if n != 4 && c >= st.SpecialCount {
+				t.Fatalf("第 %d 轮号码 %d 票数不严格小于 4：%v", i, n, seq)
+			}
+		}
+		// 每个号码都必须落在号码池内。
+		for _, n := range seq {
+			if n < 1 || n > 8 {
+				t.Fatalf("第 %d 轮号码越界：%d", i, n)
+			}
+		}
 	}
 }
 
@@ -369,8 +368,7 @@ func TestDrawBatchAndStats(t *testing.T) {
 // TestWeightsReflectExtraNumbers 确认号码池上界变化会摊薄非特殊号码的权重。
 func TestWeightsReflectExtraNumbers(t *testing.T) {
 	cfg := defaultCfg()
-	cfg.MaxNumber = 20      // 1..20 去掉特殊号码 4，others 共 19 个
-	cfg.Constrained = false // 只关心权重，不关心整轮约束
+	cfg.MaxNumber = 20 // 1..20 去掉特殊号码 4，others 共 19 个
 
 	e := newTestEngine(t, cfg, 1)
 	w := e.Weights()

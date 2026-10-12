@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 )
 
 // Config 是一次抽奖服务的完整配置。
@@ -24,9 +23,6 @@ type Config struct {
 	MaxNumber int
 	// MaxAttempts 内部整轮重抽的上限（默认 5000）。
 	MaxAttempts int
-	// Constrained 为 true 时启用整轮约束：特殊号码必须是本轮唯一最多票。
-	// 关闭后引擎退化为纯加权抽样，不做任何整轮筛选。
-	Constrained bool
 	// Port HTTP 监听端口（默认 8080）。
 	Port string
 }
@@ -40,7 +36,6 @@ func Default() Config {
 		MinNumber:     1,
 		MaxNumber:     8,
 		MaxAttempts:   5000,
-		Constrained:   true,
 		Port:          "8080",
 	}
 }
@@ -54,7 +49,6 @@ func Load() Config {
 	c.MinNumber = EnvInt("MIN_NUMBER", c.MinNumber)
 	c.MaxNumber = EnvInt("MAX_NUMBER", c.MaxNumber)
 	c.MaxAttempts = EnvInt("MAX_ATTEMPTS", c.MaxAttempts)
-	c.Constrained = EnvBool("CONSTRAINED", c.Constrained)
 	c.Port = EnvString("PORT", c.Port)
 	return c
 }
@@ -128,19 +122,4 @@ func EnvFloat(key string, def float64) float64 {
 		}
 	}
 	return def
-}
-
-// EnvBool 读取布尔环境变量，接受 1/0、true/false、yes/no、on/off，解析失败时返回默认值。
-func EnvBool(key string, def bool) bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	switch v {
-	case "":
-		return def
-	case "1", "true", "yes", "y", "on":
-		return true
-	case "0", "false", "no", "n", "off":
-		return false
-	default:
-		return def
-	}
 }

@@ -93,31 +93,41 @@ jobs:
           echo "--- /healthz ---"
           curl -fsS http://127.0.0.1:18080/healthz
 
-          echo "--- /api/meta ---"
-          curl -fsS http://127.0.0.1:18080/api/meta
+          echo "--- 首页 ---"
+          curl -fsS http://127.0.0.1:18080/ | head -c 200
 
-          echo "--- /api/draw ---"
-          draw="$(curl -fsS http://127.0.0.1:18080/api/draw)"
-          echo "$draw"
+          echo ""
+          echo "--- 连抽九次并校验「九次为一轮、4 必为唯一最高票」---"
+          jar="$(mktemp)"
+          python3 -c '
+          import json, subprocess, sys, collections
+          jar = sys.argv[1]
+          base = "http://127.0.0.1:18080/api/draw"
+          items, total, last = [], None, None
+          for i in range(1, 10):
+              out = subprocess.run(["curl", "-fsS", "-c", jar, "-b", jar, base],
+                                   capture_output=True, text=True, check=True).stdout
+              d = json.loads(out)
+              assert d["index"] == i, "第 %d 次 index 应为 %d，实际 %d" % (i, i, d["index"])
+              assert 1 <= d["number"] <= 8, "号码越界: %s" % d["number"]
+              total, last = d["total"], d
+              items.append(d["number"])
+              print("  第 %d 次 -> %d" % (i, d["number"]))
+          assert total == 9, "一轮应为 9 次，实际 %s" % total
+          assert last["roundDone"] is True, "第九次应标记本轮结束"
+          c = collections.Counter(items)
+          assert c[4] > 0, "这一轮没有命中 4: %s" % items
+          other = max(v for k, v in c.items() if k != 4)
+          assert c[4] > other, "4 不是唯一最高票: %s" % items
+          print("不变量校验通过：一轮 9 次 = %s，4 出现 %d 次，其他最多 %d 次" % (items, c[4], other))
+          ' "$jar"
 
-          # 用 python 校验核心不变量：特殊号码必须出现且是唯一最高票。
-          echo "$draw" | python3 -c '
-          import json, sys
-          d = json.load(sys.stdin)
-          items = d["items"]
-          special = d["config"]["specialNumber"]
-          assert len(items) == 9, items
-          assert items.count(special) > 0, items
-          other_max = max(c for n, c in d["stats"]["Counts"].items() if int(n) != special)
-          assert items.count(special) > other_max, (items, other_max)
-          print("不变量校验通过：特殊号码 %d 出现 %d 次，其他号码最多 %d 次"
-                % (special, items.count(special), other_max))
-          '
-
-          echo "--- 非法参数必须 400 ---"
-          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/draw?count=0)"
-          test "$code" = "400" || { echo "期望 400，实际 $code"; exit 1; }
-          echo "非法参数返回 400，符合预期"
+          echo "--- 已删除的接口应返回 404 ---"
+          for p in /api/meta /api/simulate; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080$p")"
+            test "$code" = "404" || { echo "$p 期望 404，实际 $code"; exit 1; }
+          done
+          echo "旧接口均已下线"
 
       - name: 上传覆盖率报告
         uses: actions/upload-artifact@v4
@@ -158,6 +168,16 @@ jobs:
             sleep 1
           done
 
+          echo "--- 健康检查 ---"
           curl -fsS http://127.0.0.1:18081/healthz
-          curl -fsS http://127.0.0.1:18081/api/draw
+
+          echo ""
+          echo "--- 首页 ---"
+          curl -fsS http://127.0.0.1:18081/ | grep -o "随机数生成器" | head -1
+
+          echo "--- 连抽九次（同一轮）---"
+          jar="$(mktemp)"
+          for i in $(seq 1 9); do
+            curl -fsS -c "$jar" -b "$jar" http://127.0.0.1:18081/api/draw
+          done
           echo "容器镜像运行正常"

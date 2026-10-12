@@ -108,8 +108,8 @@ foreach ($f in $allFiles) {
     # Skip anything under an excluded directory (match at any path depth).
     $parts = $rel -split '/'
     $inExcluded = $false
-    foreach ($p in $parts[0..([Math]::Max(0, $parts.Count - 2))]) {
-        if ($ExcludeDirs -contains $p) { $inExcluded = $true; break }
+    for ($i = 0; $i -lt [Math]::Max(1, $parts.Count - 1); $i++) {
+        if ($ExcludeDirs -contains $parts[$i]) { $inExcluded = $true; break }
     }
     if ($inExcluded) { $skipped += $rel; continue }
 
@@ -220,23 +220,70 @@ foreach ($f in $files) {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. Delete files that no longer exist locally
+#
+# The tree API is additive: giving it only the current files would leave deleted
+# files behind on the remote forever. So compare against the remote tree and
+# submit an explicit deletion entry (sha = null) for every stale path.
+#
+# Deletions only work when the new tree is based on the current one (base_tree),
+# otherwise GitHub rejects the request with GitRPC::BadObjectState.
+# ---------------------------------------------------------------------------
+
+$baseTreeSha = $null
+try {
+    $branchRef = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/ref/heads/$Branch" -Method Get
+    $branchCommit = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/commits/$($branchRef.object.sha)" -Method Get
+    $baseTreeSha = $branchCommit.tree.sha
+    Write-Ok "base tree = $($baseTreeSha.Substring(0, 10))"
+} catch {
+    Write-Ok "branch $Branch not found; this will be the root commit (no base tree)"
+}
+
+$deleted = @()
+if ($baseTreeSha) {
+    $remoteTree = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/trees/$baseTreeSha`?recursive=1" -Method Get
+    $localPaths = @{}
+    foreach ($f in $files) { $localPaths[$f.Path] = $true }
+
+    foreach ($item in $remoteTree.tree) {
+        if ($item.type -ne 'blob') { continue }
+        if ($localPaths.ContainsKey($item.path)) { continue }
+        $deleted += $item.path
+        $treeItems += @{
+            path = $item.path
+            mode = '100644'
+            type = 'blob'
+            sha = $null
+        }
+    }
+    if ($deleted.Count -gt 0) {
+        Write-Ok ("deleting {0} stale file(s):" -f $deleted.Count)
+        foreach ($d in $deleted) { Write-Host ("      del {0}" -f $d) }
+    } else {
+        Write-Ok 'no stale files to delete'
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 5. Create tree + commit, then update the branch ref
 # ---------------------------------------------------------------------------
 
 Write-Step 'Creating tree'
-$treeBody = @{ tree = $treeItems } | ConvertTo-Json -Depth 6 -Compress
+$treePayload = @{ tree = $treeItems }
+if ($baseTreeSha) { $treePayload['base_tree'] = $baseTreeSha }
+$treeBody = $treePayload | ConvertTo-Json -Depth 6 -Compress
 $newTree = Invoke-GitHubApi -Uri "$ApiBase/repos/$owner/$RepoName/git/trees" -Method Post -Body $treeBody
 Write-Ok "tree sha = $($newTree.sha)"
 
-# When reusing an existing repository the target branch may already have a HEAD,
-# which must be recorded as the parent commit.
+# The branch HEAD (if any) becomes the parent commit. It was already resolved
+# in step 4b while computing the base tree, so reuse it instead of asking twice.
 $parentSha = $null
-try {
-    $ref = Invoke-RestMethod -Uri "$ApiBase/repos/$owner/$RepoName/git/ref/heads/$Branch" -Headers $Headers -Method Get
-    $parentSha = $ref.object.sha
-    Write-Ok "Branch $Branch exists, parent commit = $($parentSha.Substring(0, 10))"
-} catch {
-    Write-Ok "Branch $Branch does not exist yet; this will be the root commit"
+if ($baseTreeSha) {
+    $parentSha = $branchRef.object.sha
+    Write-Ok "parent commit = $($parentSha.Substring(0, 10))"
+} else {
+    Write-Ok "branch $Branch does not exist yet; this will be the root commit"
 }
 
 Write-Step 'Creating commit'

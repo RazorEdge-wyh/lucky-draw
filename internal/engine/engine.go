@@ -12,6 +12,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/RazorEdge-wyh/lucky-draw/internal/config"
 	"github.com/RazorEdge-wyh/lucky-draw/internal/randsource"
@@ -137,12 +138,6 @@ func (e *Engine) pick() int {
 // 重抽循环有一个容易踩的坑：单纯「重抽直到命中」在参数过紧时可能永远不结束。
 // 因此这里用 MaxAttempts 硬上限兜底，超限后走构造式兜底，保证接口永不挂起。
 func (e *Engine) Draw() *Result {
-	// 无约束玩法（等概率 / 加权）：一轮定结果，不需要重抽。
-	if !e.cfg.Constrained {
-		items, _ := e.round()
-		return &Result{Items: items, Attempts: 1}
-	}
-
 	for i := 1; i <= e.cfg.MaxAttempts; i++ {
 		items, counts := e.round()
 		if e.accept(counts) {
@@ -160,7 +155,7 @@ func (e *Engine) Draw() *Result {
 }
 
 // DrawChecked 与 Draw 相同，但当兜底也失败时返回错误。
-// HTTP 层使用这个版本，以便把配置错误变成可诊断的响应。
+// 调用方需要区分「抽到了」和「配置本身就无解」时用它。
 func (e *Engine) DrawChecked() (*Result, error) {
 	res := e.Draw()
 	if len(res.Items) == 0 {
@@ -168,6 +163,27 @@ func (e *Engine) DrawChecked() (*Result, error) {
 			ErrUnreachable, e.cfg.DrawCount, e.cfg.MaxNumber-e.cfg.MinNumber, e.cfg.MaxAttempts)
 	}
 	return res, nil
+}
+
+// DrawSequence 生成一轮号码序列，直接返回切片。
+//
+// 这是给「一次只交付一个号码」的接口用的：整轮在第一次请求时就一次性生成好，
+// 之后的每次点击只是按顺序取下一个。这样做的关键好处是
+// 约束（特殊号码必须是唯一最高票）在生成时就已满足，
+// 绝不会出现「抽到第九个才发现凑不齐、只能让用户重来」的尴尬。
+func (e *Engine) DrawSequence() []int {
+	res, err := e.DrawChecked()
+	if err != nil {
+		// 参数非法时 Validate 已经拦住了；真走到这里说明出现了意料之外的
+		// 不可行配置，退化为「全部是特殊号码」也比让接口返回空切片安全。
+		log.Printf("error: 无法生成合法序列，退化为固定序列: %v", err)
+		items := make([]int, e.cfg.DrawCount)
+		for i := range items {
+			items[i] = e.cfg.SpecialNumber
+		}
+		return items
+	}
+	return res.Items
 }
 
 // DrawBatch 连续抽 n 轮，等价于调用 n 次 Draw。n <= 0 时返回 nil。
@@ -199,11 +215,8 @@ func (e *Engine) round() ([]int, map[int]int) {
 }
 
 // accept 判定：特殊号码必须出现过，且严格多于其他任何号码。
-// 关闭 Constrained 时永远接受，此时引擎退化为纯加权抽样。
+// 这是整个产品的核心约束 —— 「一轮九次，一轮一定命中 4」。
 func (e *Engine) accept(counts map[int]int) bool {
-	if !e.cfg.Constrained {
-		return true
-	}
 	c := counts[e.cfg.SpecialNumber]
 	if c == 0 {
 		return false
@@ -235,9 +248,6 @@ func (e *Engine) feasibleK() (int, bool) {
 // 例如 SPECIAL_PROB=0 时特殊号码永远抽不到，Draw 只能走兜底构造；
 // 而 DRAW_COUNT 又大于 len(others)+1 时，连构造也做不到，此时必须提前报警。
 func (e *Engine) Feasible() bool {
-	if !e.cfg.Constrained {
-		return true
-	}
 	_, ok := e.feasibleK()
 	return ok
 }
@@ -268,9 +278,6 @@ func (e *Engine) Feasible() bool {
 //
 // 这个值与穷举全部 11440 个票数向量、以及 40 万轮蒙特卡洛实测均一致（见单元测试）。
 func (e *Engine) AcceptProb() float64 {
-	if !e.cfg.Constrained {
-		return 1
-	}
 	n := e.cfg.DrawCount
 	m := len(e.others)
 	pSpecial := e.cfg.SpecialProb

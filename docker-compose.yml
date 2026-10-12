@@ -18,7 +18,6 @@ services:
       MIN_NUMBER: "1"
       MAX_NUMBER: "8"
       MAX_ATTEMPTS: "5000"
-      CONSTRAINED: "true"
     healthcheck:
       # 镜像里没有 curl/wget，用二进制自带的健康检查参数发起 HTTP 探测。
       test: ["CMD", "/lucky-draw", "-healthcheck"]

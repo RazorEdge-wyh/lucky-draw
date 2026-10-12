@@ -66,9 +66,14 @@ func main() {
 		return
 	}
 
+	api, err := httpapi.New(cfg)
+	if err != nil {
+		log.Fatalf("初始化抽奖引擎失败: %v", err)
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           httpapi.New(cfg).Handler(),
+		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -106,9 +111,9 @@ func main() {
 // describe 把关键配置拼成一行，方便在日志里快速核对线上参数。
 func describe(cfg config.Config) string {
 	return fmt.Sprintf(
-		"addr=:%s drawCount=%d special=%d specialProb=%.4f range=[%d,%d] constrained=%t maxAttempts=%d",
+		"addr=:%s drawCount=%d special=%d specialProb=%.4f range=[%d,%d] maxAttempts=%d",
 		cfg.Port, cfg.DrawCount, cfg.SpecialNumber, cfg.SpecialProb,
-		cfg.MinNumber, cfg.MaxNumber, cfg.Constrained, cfg.MaxAttempts)
+		cfg.MinNumber, cfg.MaxNumber, cfg.MaxAttempts)
 }
 
 // probeSelf 请求本机 /healthz，用作容器健康检查。
