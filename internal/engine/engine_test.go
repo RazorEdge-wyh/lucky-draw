@@ -264,8 +264,8 @@ func TestDeterministicWithSameSeed(t *testing.T) {
 	}
 }
 
-// TestCryptoSourceCoversRangeAndIsConcurrencySafe 检验生产随机源。
-func TestCryptoSourceCoversRangeAndIsConcurrencySafe(t *testing.T) {
+// TestCryptoSourceCoversRange 检验生产随机源的取值范围与覆盖度。
+func TestCryptoSourceCoversRange(t *testing.T) {
 	src := randsource.New()
 
 	// Float64 必须严格落在 [0,1)。
@@ -289,9 +289,20 @@ func TestCryptoSourceCoversRangeAndIsConcurrencySafe(t *testing.T) {
 	if len(seen) != n {
 		t.Fatalf("Intn(%d) 未覆盖全部取值: %v", n, seen)
 	}
+}
 
-	// 生产引擎必须能被并发调用（HTTP 层是多协程的）。
-	e := newTestEngine(t, defaultCfg(), 1)
+// TestEngineIsConcurrencySafe 检验生产引擎能被多协程共享。
+//
+// HTTP 层是多协程的，因此这一点必须成立。注意这里刻意使用生产随机源
+// randsource.New()：确定性源 randsource.Seeded 内部有可变状态、本身不是
+// 并发安全的，拿它跑并发测试会被竞态检测器正确抓住（那是测试写错了，
+// 不是引擎有问题）。Crypto 没有内部状态，可以安全共享。
+func TestEngineIsConcurrencySafe(t *testing.T) {
+	concEngine, err := NewWithSource(defaultCfg(), randsource.New())
+	if err != nil {
+		t.Fatalf("构造并发测试引擎失败: %v", err)
+	}
+
 	var wg sync.WaitGroup
 	errs := make(chan error, 64)
 	for g := 0; g < 16; g++ {
@@ -299,12 +310,12 @@ func TestCryptoSourceCoversRangeAndIsConcurrencySafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				res, err := e.DrawChecked()
+				res, err := concEngine.DrawChecked()
 				if err != nil {
 					errs <- err
 					return
 				}
-				if st := e.Stats(res.Items); st.TopNumber != 4 {
+				if st := concEngine.Stats(res.Items); st.TopNumber != 4 {
 					errs <- fmt.Errorf("并发下约束被破坏: %v", res.Items)
 					return
 				}
