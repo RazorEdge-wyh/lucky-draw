@@ -97,17 +97,17 @@ jobs:
           curl -fsS http://127.0.0.1:18080/ | head -c 200
 
           echo ""
-          echo "--- 连抽九轮并校验「均匀随机」---"
-          echo "（默认是真随机：每个号码等概率，没有任何号码保证出现，"
-          echo "  因此断言的是分布均匀，而不是「某个号码一定命中」）"
+          echo "--- 连抽十二轮并校验规则 ---"
+          echo "（规则两条：每轮第一个号码固定为号池上界 8；其余位置为等概率随机。"
+          echo "  因此首位必须恒为 8，其余位置的分布必须均匀。）"
           jar="$(mktemp)"
           python3 -c '
           import json, subprocess, sys, collections
           jar = sys.argv[1]
           base = "http://127.0.0.1:18080/api/draw"
-          dist = collections.Counter()
+          dist = collections.Counter()   # 只统计第 2..9 位
+          rest = 0
           rounds = 12
-          total = 0
 
           for r in range(rounds):
               for i in range(1, 10):
@@ -118,28 +118,36 @@ jobs:
                   assert 1 <= d["number"] <= 8, "号码越界: %s" % d["number"]
                   assert d["total"] == 9, "一轮应为 9 次，实际 %s" % d["total"]
                   assert d["roundDone"] == (i == 9), "第 %d 次 roundDone 错误: %s" % (i, d["roundDone"])
-                  dist[d["number"]] += 1
-                  total += 1
 
-          print("共抽取 %d 次" % total)
+                  if i == 1:
+                      # 首位固定规则：号码必须是 8，且接口要如实声明这条规则
+                      assert d["number"] == 8, "第 %d 轮第一个号码应为 8，实际 %d" % (r + 1, d["number"])
+                      assert d["firstFixed"] == 8, "第 %d 轮 firstFixed 应为 8，实际 %s" % (r + 1, d["firstFixed"])
+                      assert d["firstFixedHint"], "首位固定时 firstFixedHint 不应为空"
+                  else:
+                      dist[d["number"]] += 1
+                      rest += 1
+
+          print("首位校验通过：%d 轮的第一个号码全部为 8" % rounds)
+          print("其余位置共 %d 次：" % rest)
           for n in range(1, 9):
-              print("  号码 %d -> %d 次 (%.1f%%)" % (n, dist[n], 100.0 * dist[n] / total))
+              print("  号码 %d -> %d 次 (%.1f%%)" % (n, dist[n], 100.0 * dist[n] / rest))
 
           missing = [n for n in range(1, 9) if dist[n] == 0]
-          assert not missing, "这些号码从未出现（均匀随机下不该发生）: %s" % missing
+          assert not missing, "这些号码在第 2..9 位从未出现（均匀随机下不该发生）: %s" % missing
 
-          # 12 轮 = 108 次抽取，单个号码占比的标准差约 0.032，
-          # 取 1/8 ± 0.13 是很宽松的区间：不会误报，但能抓出「某个号码被系统性抬高」。
+          # 12 轮 × 8 = 96 次，单个号码占比的标准差约 0.034，
+          # 取 1/8 ± 0.14 是很宽松的区间：不会误报，但能抓出系统性偏向。
           want = 1.0 / 8.0
           for n in range(1, 9):
-              share = dist[n] / float(total)
-              assert abs(share - want) <= 0.13, \
-                  "号码 %d 占比 %.3f 明显偏离均匀值 %.3f" % (n, share, want)
+              share = dist[n] / float(rest)
+              assert abs(share - want) <= 0.14, \
+                  "号码 %d 在其余位置的占比 %.3f 明显偏离均匀值 %.3f" % (n, share, want)
 
           # 关键回归断言：如果又变回「每轮必中 4」，4 的占比会接近 37%。
-          share4 = dist[4] / float(total)
+          share4 = dist[4] / float(rest)
           assert share4 < 0.25, "号码 4 占比 %.3f 偏高，像是重新启用了有偏模式" % share4
-          print("均匀性校验通过：4 的占比 %.3f，未出现有偏模式特征" % share4)
+          print("其余位置均匀性通过：4 的占比 %.3f" % share4)
           ' "$jar"
 
           echo "--- 已删除的接口应返回 404 ---"

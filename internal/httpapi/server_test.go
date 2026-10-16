@@ -229,19 +229,19 @@ func TestFirstDrawStartsNewRound(t *testing.T) {
 	}
 }
 
-// TestUniformRoundIsFairAndComplete 默认模式是**均匀随机**。
+// TestRoundFirstNumberIsFixedAndRestIsUniform 校验本轮的实际规则。
 //
-// 一轮九次、每次只返回一个号码，号码在 1..8 之间均匀分布：
-//   - 没有任何号码享有「保证出现」的特权（4 也可能整轮不出现，这是正常的）；
-//   - 每个号码的总体占比应当接近 1/8。
+// 规则只有两条：
+//  1. 每轮第一个号码固定为号码池上界（默认 8）—— 这是刻意固定的，不是随机；
+//  2. 第 2..9 位是 1..8 的等概率抽取，没有任何号码享有特权。
 //
-// 这个测试就是「真随机」的守护者：如果有人重新引入偏向，它会失败。
-func TestUniformRoundIsFairAndComplete(t *testing.T) {
+// 这个测试同时守护两件事：首位固定没被改掉，以及其余位置没被引入偏向。
+func TestRoundFirstNumberIsFixedAndRestIsUniform(t *testing.T) {
 	h := newTestHandler(t)
 
 	const rounds = 400
-	dist := map[int]int{}
-	totalDraws := 0
+	distRest := map[int]int{} // 只统计第 2..9 位
+	restDraws := 0
 
 	for roundNo := 1; roundNo <= rounds; roundNo++ {
 		c := newClient(h) // 每轮换一个全新"浏览器"，确保是独立的一轮
@@ -260,9 +260,24 @@ func TestUniformRoundIsFairAndComplete(t *testing.T) {
 			if resp.Number < 1 || resp.Number > 8 {
 				t.Fatalf("号码越界: %d", resp.Number)
 			}
+			// 首位必须固定为 8，且响应里要如实声明这条规则。
+			if i == 1 {
+				if resp.Number != 8 {
+					t.Fatalf("第 %d 轮第一个号码应为 8，实际 %d", roundNo, resp.Number)
+				}
+				if resp.FirstFixed != 8 {
+					t.Fatalf("第 %d 轮 firstFixed 应为 8，实际 %d", roundNo, resp.FirstFixed)
+				}
+				if resp.FirstFixedHint == "" {
+					t.Fatal("首位固定时 firstFixedHint 不应为空")
+				}
+			}
+			// 第 2..9 位参与分布统计。
+			if i > 1 {
+				distRest[resp.Number]++
+				restDraws++
+			}
 			items = append(items, resp.Number)
-			dist[resp.Number]++
-			totalDraws++
 		}
 
 		if len(items) != 9 {
@@ -270,22 +285,21 @@ func TestUniformRoundIsFairAndComplete(t *testing.T) {
 		}
 	}
 
-	// 每个号码都应出现过，且占比接近 1/8。
-	// 400 轮 × 9 次 = 3600 次抽取，单个号码占比的标准差约 0.0055，
-	// 因此 1/8 ± 0.04 是很宽松的区间，不会误报，但足以抓出明显偏向。
+	// 第 2..9 位（400 轮 × 8 = 3200 次）每个号码占比应接近 1/8。
+	// 标准差约 0.0058，取 ±0.04 是很宽松的区间：不会误报，但能抓出明显偏向。
 	want := 1.0 / 8.0
 	for n := 1; n <= 8; n++ {
-		if dist[n] == 0 {
-			t.Errorf("号码 %d 从未出现（均匀随机下不该发生）", n)
+		if distRest[n] == 0 {
+			t.Errorf("号码 %d 在第 2..9 位从未出现（均匀随机下不该发生）", n)
 		}
-		share := float64(dist[n]) / float64(totalDraws)
+		share := float64(distRest[n]) / float64(restDraws)
 		if diff := share - want; diff > 0.04 || diff < -0.04 {
-			t.Errorf("号码 %d 占比 %.4f，偏离均匀值 %.4f 过多（可能存在偏向）", n, share, want)
+			t.Errorf("号码 %d 在其余位置的占比 %.4f，偏离均匀值 %.4f 过多", n, share, want)
 		}
 	}
 
-	// 关键回归断言：4 的占比必须**接近 1/8，而不是有偏模式下的约 37%**。
-	share4 := float64(dist[4]) / float64(totalDraws)
+	// 关键回归断言：4 不能接近有偏模式下的约 37%。
+	share4 := float64(distRest[4]) / float64(restDraws)
 	if share4 > 0.2 {
 		t.Errorf("号码 4 占比 %.4f 明显偏高，像是又启用了有偏模式（应为 %.4f）", share4, want)
 	}

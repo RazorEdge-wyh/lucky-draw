@@ -234,25 +234,86 @@ func TestUniformSpecialCountIsZero(t *testing.T) {
 	}
 }
 
-// TestUniformDrawDistribution 均匀随机的分布校验：40 万次抽样每个号码占比约 1/8。
+// TestFirstNumberIsFixed 首位固定规则必须稳定：每一轮的第一个号码都是号码池上界。
+//
+// 这条规则是刻意设计的（不是随机结果），因此单独用测试钉住，防止被无意改掉。
+func TestFirstNumberIsFixed(t *testing.T) {
+	cfg := uniformCfg()
+	e := newTestEngine(t, cfg, 11)
+
+	for i := 0; i < 300; i++ {
+		seq := e.DrawSequence()
+		if len(seq) != cfg.DrawCount {
+			t.Fatalf("第 %d 轮长度应为 %d，实际 %d", i, cfg.DrawCount, len(seq))
+		}
+		if seq[0] != cfg.MaxNumber {
+			t.Fatalf("第 %d 轮第一个号码应为 %d，实际 %d（序列 %v）",
+				i, cfg.MaxNumber, seq[0], seq)
+		}
+	}
+
+	// 引擎必须如实报告这条规则，供接口层转达给调用方。
+	if n, fixed := e.FirstNumberFixed(); !fixed || n != cfg.MaxNumber {
+		t.Errorf("FirstNumberFixed 应返回 (%d, true)，实际 (%d, %t)", cfg.MaxNumber, n, fixed)
+	}
+}
+
+// TestFirstNumberFixedFollowsPoolSize 首位固定的是「号码池上界」，随配置变化，
+// 不是写死的 8。这样改 MAX_NUMBER 时行为是自洽的。
+func TestFirstNumberFixedFollowsPoolSize(t *testing.T) {
+	for _, maxNumber := range []int{6, 8, 12, 20} {
+		cfg := uniformCfg()
+		cfg.MaxNumber = maxNumber
+		e := newTestEngine(t, cfg, 3)
+
+		if n, fixed := e.FirstNumberFixed(); !fixed || n != maxNumber {
+			t.Errorf("MAX_NUMBER=%d 时 FirstNumberFixed 应返回 (%d, true)，实际 (%d, %t)",
+				maxNumber, maxNumber, n, fixed)
+		}
+		for i := 0; i < 50; i++ {
+			seq := e.DrawSequence()
+			if seq[0] != maxNumber {
+				t.Fatalf("MAX_NUMBER=%d 时第 %d 轮首位应为 %d，实际 %d",
+					maxNumber, i, maxNumber, seq[0])
+			}
+			// 其余位置必须仍然落在号码池内。
+			for _, n := range seq {
+				if n < cfg.MinNumber || n > maxNumber {
+					t.Fatalf("号码越界: %d（池 %d..%d）", n, cfg.MinNumber, maxNumber)
+				}
+			}
+		}
+	}
+}
+
+// TestUniformDrawDistribution 第 2..9 位的分布校验：每个号码占比约 1/8。
+//
+// 首位被固定为 8，因此它天然偏离 1/8（约 1/9 + 8/9·1/8 ≈ 22%），
+// 这里只统计其余位置，避免把「刻意固定」误判成「偏向」。
 func TestUniformDrawDistribution(t *testing.T) {
 	e := newTestEngine(t, uniformCfg(), 2026)
 
-	const draws = 400000
+	const rounds = 40000
 	dist := map[int]int{}
-	for i := 0; i < draws/9; i++ {
-		for _, n := range e.DrawSequence() {
+	restDraws := 0
+
+	for i := 0; i < rounds; i++ {
+		seq := e.DrawSequence()
+		for pos, n := range seq {
+			if pos == 0 {
+				continue // 首位固定，不参与均匀性统计
+			}
 			dist[n]++
+			restDraws++
 		}
 	}
-	total := (draws / 9) * 9
 
 	want := 1.0 / 8.0
 	for n := 1; n <= 8; n++ {
-		share := float64(dist[n]) / float64(total)
-		// 4e5 次抽样的二项标准差约 0.0005，取 0.004 容忍度
+		share := float64(dist[n]) / float64(restDraws)
+		// 3.2e5 次抽样的二项标准差约 0.00055，取 0.004 容忍度
 		if math.Abs(share-want) > 0.004 {
-			t.Errorf("号码 %d 占比 %.5f，期望 %.5f（偏离过大）", n, share, want)
+			t.Errorf("号码 %d 在其余位置的占比 %.5f，期望 %.5f（偏离过大）", n, share, want)
 		}
 	}
 }

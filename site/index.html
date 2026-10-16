@@ -58,6 +58,11 @@ h1{margin:0 0 36px; font-size:19px; font-weight:600; letter-spacing:.02em}
   animation:chip .22s ease-out;
 }
 .result i.placeholder{background:transparent; border:1px dashed var(--line); color:transparent}
+/* 首位被固定的号码：带一个星号标注，悬停可看说明 */
+.result i.fixed-first{cursor:help}
+.result i .fixed{
+  font-size:11px; font-weight:700; vertical-align:super; margin-left:1px; opacity:.75;
+}
 @keyframes chip{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
 .result .summary{width:100%; margin-top:8px; font-size:13px; color:var(--muted)}
 .result .summary b{color:var(--btn); font-weight:600}
@@ -88,17 +93,21 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
 /* ===========================================================================
    随机数生成器（静态版）
 
-   **均匀随机**：号码池 1..8，每个号码概率完全相等（各 1/8）。
-   九次为一轮，每次点击抽出一个号码；九次是彼此独立的独立抽取。
+   号码池 1..8，九次为一轮，每次点击抽出一个号码。规则只有两条：
+
+     1. **本轮第一个号码固定为号码池上界**（池是 1..8，所以固定是 8）；
+     2. 其余位置是 1..8 的等概率抽取，彼此独立、无任何加权或筛选。
 
    因此：
-     - 没有任何号码享有特权，也没有任何号码保证出现；
-     - 某个号码一整轮都不出现是正常现象（概率约 (7/8)^9 ≈ 30%）；
+     - 第一位不是随机结果，而是刻意固定的 —— 结果区里它会带一个星号标注，
+       悬停可以看到说明。这是刻意为之，不是 bug；
+     - 第 2..9 位没有任何号码享有特权，也没有任何号码保证出现；
+     - 某个号码（除首位外）一整轮都不出现是正常现象；
      - 一轮里出现重复号码也是正常的。
 
    随机源用 crypto.getRandomValues()（浏览器自带的密码学安全随机源），
    不是 Math.random()。取模偏置用拒绝采样消除，与 Go 版 randsource 实现同源。
-   算法与仓库里 Go 服务端的均匀随机路径一致。
+   算法与仓库里 Go 服务端的默认路径一致（那边同样是首位固定、其余均匀）。
 
    历史说明：项目最初是「加权抽样 + 整轮必中 4」的有偏实现，
    那套算法已完整备份在 internal/engine/biased_backup.go 与
@@ -171,13 +180,20 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
 
   /* ------------------------------------------------------------ 整轮生成 */
 
-  // 生成一整轮：九次彼此独立的等概率抽取，不做任何筛选或重抽。
+  // 生成一整轮。规则两条，别的没有：
+  //   1. **第一个号码固定为号码池上界**（默认池 1..8，所以固定是 8）；
+  //   2. 其余位置是 1..maxNumber 的等概率抽取，彼此独立、无任何加权或筛选。
   //
-  // 因此某一轮里某个号码一次都不出现是完全正常的
-  // （某个指定号码九次全不出现的概率约 (7/8)^9 ≈ 30%）。
+  // 「第一个必是 8」是刻意设计而不是随机结果，所以结果区里第一个号码会带星号
+  // 标注（见 renderResult），避免看的人把它误当成随机抽出来的。
+  //
+  // 由于其余位置仍是全池均匀抽取，某个号码一轮里一次都不出现依然正常。
   function generateRound(pool, cfg) {
     var items = [];
     for (var i = 0; i < cfg.drawCount; i++) { items.push(pick(pool)); }
+    // 固定首位。放在最后覆盖而不是跳过首位不抽，是为了让其余位置的
+    // 分布与「九次独立均匀抽取」完全一致，便于推理与测试。
+    if (items.length > 0) { items[0] = cfg.maxNumber; }
     return items;
   }
 
@@ -215,6 +231,16 @@ button:focus-visible{outline:2px solid var(--btn); outline-offset:3px}
       if (i < items.length) {
         chip.textContent = String(items[i]);
         chip.title = "第 " + (i + 1) + " 次";
+
+        // 首位是固定的，用星号标注出来，并给出说明
+        if (i === 0) {
+          var mark = document.createElement("b");
+          mark.className = "fixed";
+          mark.textContent = "*";
+          chip.appendChild(mark);
+          chip.className = "fixed-first";
+          chip.title = "每轮第一个数字固定为 " + CONFIG.maxNumber + "，其余位置等概率随机";
+        }
       } else {
         chip.className = "placeholder";
         chip.textContent = "·";

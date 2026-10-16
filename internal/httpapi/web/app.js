@@ -14,10 +14,15 @@
   var index = 0;      // 本轮已抽次数
   var items = [];     // 本轮已抽出的号码，用于「本轮结果」展示
 
+  // 首位固定规则（由服务端下发）：firstFixed 为 0 表示首位不固定。
+  // 界面上第一个号码会带一个星号，悬停显示 firstFixedHint，让看的人知道它不是随机的。
+  var firstFixed = 0;
+  var firstFixedHint = "";
+
   /* -------------------------------------------------------------- 本轮结果 */
 
-  // 把本轮已抽的号码按顺序排开，统一样式，不区分哪个是特殊号码；
-  // 还没抽的位置用虚线占位，让人一眼看出本轮还剩几次。
+  // 把本轮已抽的号码按顺序排开，统一样式；
+  // 首位若被固定，在数字后加一个星号标注；还没抽的位置用虚线占位。
   function renderResult(justFinished) {
     resultEl.innerHTML = "";
 
@@ -34,6 +39,15 @@
       if (i < items.length) {
         chip.textContent = String(items[i]);
         chip.title = "第 " + (i + 1) + " 次";
+
+        if (i === 0 && firstFixed > 0) {
+          var mark = document.createElement("b");
+          mark.className = "fixed";
+          mark.textContent = "*";
+          chip.appendChild(mark);
+          chip.title = firstFixedHint || ("每轮第一个数字固定为 " + firstFixed);
+          chip.className = "fixed-first";
+        }
       } else {
         chip.className = "placeholder";
         chip.textContent = "·";
@@ -146,6 +160,10 @@
         round = res.round;
         index = res.index;
         poolSize = TOTAL;
+
+        // 服务端下发的「首位固定」规则，用于结果区里的星号标注
+        if (typeof res.firstFixed === "number") { firstFixed = res.firstFixed; }
+        if (res.firstFixedHint) { firstFixedHint = res.firstFixedHint; }
 
         // 编号从 1 开始，因此第 1 次抽取时把上一轮的结果清掉
         if (res.index === 1) { items = []; }

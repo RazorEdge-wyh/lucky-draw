@@ -164,11 +164,41 @@ func (e *Engine) pick() int {
 	return e.pool[len(e.pool)-1]
 }
 
-// DrawUniform 生成一轮**均匀随机**序列：每个号码等概率，无任何加权、无整轮筛选。
+// DrawUniform 生成一轮号码序列。
 //
-// 这是默认路径。九次抽取彼此独立，因此某一轮里没有任何号码是「保证出现」的 ——
-// 某个号码一轮里一次都没出现是正常现象（概率约 (7/8)^9 ≈ 30%）。
+// 规则（两条，别的没有）：
+//  1. **本轮第一个号码固定为号码池上界**（默认号码池 1..8，所以固定是 8）；
+//  2. 其余位置都是 1..maxNumber 的等概率抽取，彼此独立、无任何加权或筛选。
+//
+// 因此「第一个必是 8」是**刻意设计**而不是随机结果 —— 界面上第一个号码带星号
+// 提示（见 FirstNumberHint），避免看的人把它误当成随机抽出来的。
+//
+// 由于第 2..N 位仍是全池均匀抽取，某个号码一轮里一次都不出现依然正常。
 func (e *Engine) DrawUniform() *Result {
+	res := e.DrawUniformRaw()
+	// 固定首位。放在最后覆盖而不是跳过首位不抽，是为了让其余位置的
+	// 分布与「九次独立均匀抽取」完全一致，便于推理与测试。
+	if len(res.Items) > 0 {
+		res.Items[0] = e.cfg.MaxNumber
+	}
+	return res
+}
+
+// FirstNumberFixed 报告本轮第一个号码是否被固定，以及固定成哪个号码。
+//
+// 供 HTTP 层在响应里带上这个信息，让前端能把它标注出来（而不是静默固定）。
+func (e *Engine) FirstNumberFixed() (int, bool) {
+	if e.cfg.DrawCount < 1 {
+		return 0, false
+	}
+	return e.cfg.MaxNumber, true
+}
+
+// DrawUniformRaw 生成一轮**完全均匀**的序列：没有任何位置被固定。
+//
+// 这是留给「不需要固定首位」的调用方的逃生通道（例如自写接口、做统计对比）。
+// 默认路径 DrawUniform 会固定首位，两者只差这一处。
+func (e *Engine) DrawUniformRaw() *Result {
 	items := make([]int, e.cfg.DrawCount)
 	for i := range items {
 		items[i] = e.pickUniform()

@@ -13,6 +13,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -129,6 +130,10 @@ type Server struct {
 	engine *engine.Engine
 	cfg    config.Config
 	store  *store
+	// firstFixed / firstFixedHint 是「本轮第一个号码被固定」这个规则的对外说明。
+	// 启动时算一次，之后每个响应都带上，保证规则始终对调用方可见。
+	firstFixed     int
+	firstFixedHint string
 }
 
 // New 构造 HTTP 服务。base 来自环境变量。
@@ -137,7 +142,13 @@ func New(base config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	s := &Server{engine: eng, cfg: base, store: newStore()}
+	if n, fixed := eng.FirstNumberFixed(); fixed {
+		s.firstFixed = n
+		s.firstFixedHint = fmt.Sprintf("每轮第一个数字固定为 %d，其余位置等概率随机", n)
+	}
+
 	go s.cleanupLoop()
 	return s, nil
 }
@@ -181,6 +192,13 @@ type drawResponse struct {
 	RoundDone bool `json:"roundDone"`
 	// Round 是本会话当前的轮数（从 1 开始）。
 	Round int `json:"round"`
+	// FirstFixed 是本轮第一个位置被固定的号码；0 表示首位不固定。
+	//
+	// 把它放进响应里是刻意的：规则必须对调用方可见，
+	// 这样前端才能如实标注出来，而不是让结果看起来像纯随机。
+	FirstFixed int `json:"firstFixed"`
+	// FirstFixedHint 是给界面用的一句说明；首位不固定时为空串。
+	FirstFixedHint string `json:"firstFixedHint,omitempty"`
 }
 
 type errorResponse struct {
@@ -238,11 +256,13 @@ func (s *Server) handleDraw(w http.ResponseWriter, r *http.Request) {
 		shortID(id), n, sess.pos, len(sess.seq), roundNumber, roundDone)
 
 	writeJSON(w, http.StatusOK, drawResponse{
-		Number:    n,
-		Index:     sess.pos,
-		Total:     len(sess.seq),
-		RoundDone: roundDone,
-		Round:     roundNumber,
+		Number:         n,
+		Index:          sess.pos,
+		Total:          len(sess.seq),
+		RoundDone:      roundDone,
+		Round:          roundNumber,
+		FirstFixed:     s.firstFixed,
+		FirstFixedHint: s.firstFixedHint,
 	})
 }
 

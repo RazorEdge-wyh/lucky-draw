@@ -136,6 +136,15 @@ h1{
   border:1px dashed var(--line);
   color:transparent;
 }
+/* 首位被固定的号码：带一个星号标注，悬停可看说明 */
+.result i.fixed-first{cursor:help}
+.result i .fixed{
+  font-size:11px;
+  font-weight:700;
+  vertical-align:super;
+  margin-left:1px;
+  opacity:.75;
+}
 @keyframes chip{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
 /* 本轮小结，只在抽满九次后出现 */
 .result .summary{
