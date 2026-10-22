@@ -298,3 +298,10 @@ go test -bench=. -benchmem ./internal/engine/
 ## 📄 License
 
 [MIT](LICENSE)
+
+
+---
+
+## 作者 / Author
+
+**湖南科技大学 · 26 级 · 王越豪** · GitHub [@RazorEdge-wyh](https://github.com/RazorEdge-wyh)
